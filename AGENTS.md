@@ -46,11 +46,13 @@ existing parts" than "build a storage engine from scratch."
   rotate-token <name>` yet. Should probably mirror poche-resend-webmail's own
   `readSecretFlag` pattern (stdin or `env:NAME`, never argv) if/when a
   CLI-supplied (rather than always-generated) token is needed.
-- **poche-resend-webmail's migration path**: does `blobstore.go` get replaced
-  outright (attachments only ever live in machin-esetres going forward), or
-  does it become a two-tier cache (recent/hot attachments on local disk,
-  everything else in machin-esetres)? Affects whether Phase 1 needs a
-  bulk-migrate-existing-attachments tool from day one.
+- ~~**poche-resend-webmail's migration path**~~ **Scoped 2026-08-08** — see
+  `poche-resend-webmail/AGENTS.md`'s "Scoped: moving attachment storage to
+  machin-esetres" section: outright replacement (not a two-tier cache), a
+  feature-flagged phased cutover (reads before writes, local `BLOB_DIR` kept
+  until re-verified empty), one shared bucket rather than bucket-per-mailbox
+  (poche-resend-webmail already isolates by `mailbox_id` itself). Not yet
+  implemented — the plan, not the code.
 - **Backup story**: machin-esetres's own data directory is a natural
   machin-vault `file` target (rsync-based) — should it be, from day one, or is
   that a separate follow-up once the service exists and has real data?
