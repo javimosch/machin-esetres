@@ -28,19 +28,20 @@ directory.
 
 ## Status
 
-**Design phase.** This README is the spec before the code. See
-[AGENTS.md](AGENTS.md) for the full architecture, the phased roadmap, and the
-open questions still to resolve before Phase 1 implementation starts.
+**Phase 1 is built and passing its smoke test** (`./smoke.sh`): buckets,
+sha256-deduped objects with refcounted delete, bearer-token HTTP API
+(PUT/GET/HEAD/DELETE + prefix list), and the CLI, all in one native binary.
+Not yet deployed to rbm21 or wired into poche-resend-webmail — see
+[AGENTS.md](AGENTS.md) for the open questions and next steps.
 
 ## The plan, in short
 
-- **Phase 1 — custom REST + CLI.** Bucket/key object model, bearer-token auth
-  (the same pattern poche-resend-webmail already uses), agent-first JSON
-  responses, built directly on `machweb.src` (machin's existing HTTP framework —
-  it already has binary-safe request bodies, multipart parsing, streaming
-  responses, and HMAC signing; no new framework needed to start). Fixes the
-  actual problem: attachments get a real API, sha256-based dedup, and a host
-  independent of poche-resend-webmail's own disk.
+- **Phase 1 — custom REST + CLI. Done.** Bucket/key object model, bearer-token
+  auth (the same pattern poche-resend-webmail already uses), agent-first JSON
+  responses, built directly on `machweb.src` (machin's existing HTTP framework
+  — binary-safe request bodies, streaming responses, routing; no new framework
+  needed). Fixes the actual problem: attachments get a real API, sha256-based
+  dedup, and a host independent of poche-resend-webmail's own disk.
 - **Phase 2 — a real S3-compatible facade.** AWS SigV4 request signing + the
   actual S3 REST API shape on top of the same bucket/key/object model, so
   `aws-cli`, `mc`, `rclone`, and any S3 SDK work against it unmodified — a real
@@ -81,36 +82,53 @@ CRUD demo) — `key -> sha256` with a refcount per blob, so deleting a key
 decrements the count and only unlinks the blob file at zero. Multiple keys
 (even across different original filenames) can point at the same blob.
 
-## API (Phase 1 — draft, not yet built)
+## API (Phase 1 — as built)
 
 ```
 PUT    /b/<bucket>/o/<key>        upload — body is the raw bytes
 GET    /b/<bucket>/o/<key>        download
-HEAD   /b/<bucket>/o/<key>        metadata only
+HEAD   /b/<bucket>/o/<key>        JSON metadata (not a bodyless response — see AGENTS.md)
 DELETE /b/<bucket>/o/<key>        delete (refcount-aware)
-GET    /b/<bucket>?prefix=<p>     list, JSON: {"ok":true,"items":[...],"next":...}
-PUT    /b/<bucket>                create bucket
-DELETE /b/<bucket>                delete bucket (empty only, or ?force=1)
+GET    /b/<bucket>?prefix=<p>     list, JSON: {"ok":true,"items":[...]}  (no pagination cursor yet)
 GET    /healthz                   health
 ```
 
 Auth: `Authorization: Bearer <token>`, one token per bucket — same shape as
 poche-resend-webmail's own `WEBMAIL_TOKEN`/`ADMIN_TOKEN`, nothing new to learn.
 
-## CLI (Phase 1 — draft)
+Bucket creation/deletion is **CLI-only** in Phase 1, not an HTTP route — one
+less auth concept (no separate admin token) for a decision that doesn't need
+to happen over the network.
+
+## CLI (Phase 1 — as built)
 
 Same agent-first contract as machin-vault: `{"version":"1","ok":true,...}` on
 stdout, errors on stderr in the same envelope, semantic exit-code bands,
 `help-json` for self-description.
 
 ```bash
-machin-esetres bucket create <name>
-machin-esetres put <bucket> <key> <file>       # or - for stdin
-machin-esetres get <bucket> <key> [--to file]
-machin-esetres rm <bucket> <key>
-machin-esetres ls <bucket> [--prefix p]
-machin-esetres serve --port 9000
+machin-esetres -d <data-dir> bucket create <name>   # prints the token — shown once, here only
+machin-esetres -d <data-dir> bucket list
+machin-esetres -d <data-dir> put <bucket> <key> <file> [--content-type <ct>]
+machin-esetres -d <data-dir> get <bucket> <key> --to <file>
+machin-esetres -d <data-dir> rm <bucket> <key>
+machin-esetres -d <data-dir> ls <bucket> [--prefix p]
+machin-esetres -d <data-dir> serve --port 9000
 machin-esetres help-json
+```
+
+`put`/`get` take real file paths only in Phase 1 (no `-` for stdin — see
+AGENTS.md's non-goals).
+
+### Try it
+
+```bash
+./build.sh
+./machin-esetres -d ./data bucket create mymailbox     # copy the printed token
+./machin-esetres -d ./data put mymailbox hello.txt ./README.md
+./machin-esetres -d ./data ls mymailbox
+./machin-esetres -d ./data serve --port 9000 &
+curl -H "Authorization: Bearer <token>" http://localhost:9000/b/mymailbox/o/hello.txt
 ```
 
 ## What this does *not* fix

@@ -1,0 +1,222 @@
+// store.src — the object store's core: buckets, sha256-deduped objects, a
+// SQLite index per bucket, a plain SQLite registry of bucket tokens.
+//
+// Every function here is shared by the CLI (main.src) and the HTTP server
+// (server.src) — and NONE of them call die()/exit(). A shared function that
+// exits would kill the whole daemon on one bad request; only the CLI-only
+// wrappers in main.src (and cmd_bucket_create, which has no HTTP path in
+// Phase 1) are allowed to die().
+//
+// Layout on disk:
+//   <data>/buckets.db                                  bucket name -> token
+//   <data>/<bucket>/index.db                           key -> sha, blobs -> refcount
+//   <data>/<bucket>/objects/<sha[0:2]>/<sha[2:4]>/<sha> the blob, content-addressed
+
+type ShaRow struct { sha string }
+type ObjMeta struct { sha string  content_type string }
+type BlobRow struct { sha string  refcount int }
+type BucketRow struct { name string  token string  created_at int }
+type TokenRow struct { token string }
+
+func bucket_dir(data, name) (p) { p = data + "/" + name }
+
+func blob_shard_path(bdir, sha) (p) {
+    p = bdir + "/objects/" + substr(sha, 0, 2) + "/" + substr(sha, 2, 4) + "/" + sha
+}
+
+// mkdir_p creates every missing directory along path (mkdir is single-level).
+func mkdir_p(path) {
+    if path == "" { return }
+    if is_dir(path) { return }
+    prefix := ""
+    rest := path
+    if has_prefix(path, "/") { prefix = "/"  rest = substr(path, 1, len(path)) }
+    cur := prefix
+    for _, part := range split(rest, "/") {
+        if part == "" { continue }
+        if cur == "" || cur == "/" { cur = cur + part } else { cur = cur + "/" + part }
+        if !is_dir(cur) { mkdir(cur) }
+    }
+}
+
+func mask_token(s) (m) {
+    m = "…"
+    if len(s) > 8 { m = substr(s, 0, 3) + "…" + substr(s, len(s) - 4, len(s)) }
+}
+
+// resolve_bucket_token looks up a bucket's bearer token — the HTTP layer's auth check.
+func resolve_bucket_token(data, name) (token, ok) {
+    token = ""
+    ok = 0
+    if !is_dir(data) { return }
+    reg := sqlite_open(data + "/buckets.db")
+    rows := sqlite_query(reg, "SELECT token FROM buckets WHERE name=?", []string{name})
+    sqlite_close(reg)
+    list := parse(rows, []TokenRow{})
+    if len(list) > 0 { token = list[0].token  ok = 1 }
+}
+
+// bucket_create makes a bucket dir + its index tables, mints a token, and
+// registers it. CLI-only in Phase 1 (no HTTP route creates buckets), so it is
+// allowed to be the one "core" function that's fine to wrap with die() at the
+// call site rather than threading an ok flag through — nothing else calls it.
+func bucket_create(data, name) (token, ok) {
+    ok = 0
+    token = ""
+    bdir := bucket_dir(data, name)
+    if is_dir(bdir) { return }
+    mkdir_p(bdir + "/objects")
+    idxdb := sqlite_open(bdir + "/index.db")
+    sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS objects(key TEXT PRIMARY KEY, sha TEXT, size INTEGER, content_type TEXT, created_at INTEGER)")
+    sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS blobs(sha TEXT PRIMARY KEY, refcount INTEGER)")
+    sqlite_close(idxdb)
+    token = to_hex(rand_bytes(16))
+    reg := sqlite_open(data + "/buckets.db")
+    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER)")
+    sqlite_exec(reg, "INSERT INTO buckets(name, token, created_at) VALUES(?, ?, ?)", []string{name, token, str(now())})
+    sqlite_close(reg)
+    ok = 1
+}
+
+func bucket_list_body(data) (body) {
+    body = "\"buckets\":[]"
+    if !is_dir(data) { return }
+    reg := sqlite_open(data + "/buckets.db")
+    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER)")
+    rows := sqlite_query(reg, "SELECT name, token, created_at FROM buckets ORDER BY name")
+    sqlite_close(reg)
+    list := parse(rows, []BucketRow{})
+    s := "\"buckets\":["
+    i := 0
+    for _, b := range list {
+        if i > 0 { s = s + "," }
+        s = s + "{\"name\":\"" + b.name + "\",\"token\":\"" + mask_token(b.token) + "\",\"created_at\":" + str(b.created_at) + "}"
+        i = i + 1
+    }
+    s = s + "]"
+    body = s
+}
+
+// blob_ref_dec decrements a blob's refcount, deleting the file + row at zero.
+func blob_ref_dec(bdir, idxdb, sha) {
+    rows := sqlite_query(idxdb, "SELECT refcount FROM blobs WHERE sha=?", []string{sha})
+    list := parse(rows, []BlobRow{})
+    if len(list) == 0 { return }
+    nc := list[0].refcount - 1
+    if nc <= 0 {
+        sqlite_exec(idxdb, "DELETE FROM blobs WHERE sha=?", []string{sha})
+        remove(blob_shard_path(bdir, sha))
+    } else {
+        sqlite_exec(idxdb, "UPDATE blobs SET refcount=? WHERE sha=?", []string{str(nc), sha})
+    }
+}
+
+// obj_put stores raw under key in bucket, content-addressed by sha256. Two
+// keys with identical bytes share one blob on disk (refcounted); overwriting
+// a key re-points it and decrements the old blob's refcount. ok=0 only if the
+// bucket doesn't exist — never dies, so a bad request can't take the server down.
+func obj_put(data, bucket, key, raw, content_type) (sha, size, ok) {
+    ok = 0
+    sha = ""
+    size = 0
+    bdir := bucket_dir(data, bucket)
+    if !is_dir(bdir) { return }
+    idxdb := sqlite_open(bdir + "/index.db")
+    sha = to_hex(sha256_bytes(raw))
+    size = len(raw)
+
+    old_rows := sqlite_query(idxdb, "SELECT sha FROM objects WHERE key=?", []string{key})
+    old_list := parse(old_rows, []ShaRow{})
+    old_sha := ""
+    if len(old_list) > 0 { old_sha = old_list[0].sha }
+
+    if old_sha != sha {
+        exist_rows := sqlite_query(idxdb, "SELECT sha FROM blobs WHERE sha=?", []string{sha})
+        exist_list := parse(exist_rows, []ShaRow{})
+        if len(exist_list) == 0 {
+            shard := bdir + "/objects/" + substr(sha, 0, 2) + "/" + substr(sha, 2, 4)
+            mkdir_p(shard)
+            write_file_bytes(blob_shard_path(bdir, sha), raw)
+            sqlite_exec(idxdb, "INSERT INTO blobs(sha, refcount) VALUES(?, 1)", []string{sha})
+        } else {
+            sqlite_exec(idxdb, "UPDATE blobs SET refcount = refcount + 1 WHERE sha=?", []string{sha})
+        }
+        if old_sha != "" { blob_ref_dec(bdir, idxdb, old_sha) }
+        sqlite_exec(idxdb, "INSERT OR REPLACE INTO objects(key, sha, size, content_type, created_at) VALUES(?, ?, ?, ?, ?)",
+            []string{key, sha, str(size), content_type, str(now())})
+    } else {
+        // identical content re-uploaded under the same key: no blob/refcount
+        // change, but metadata (content-type) may have been updated.
+        sqlite_exec(idxdb, "UPDATE objects SET content_type=?, created_at=? WHERE key=?", []string{content_type, str(now()), key})
+    }
+    sqlite_close(idxdb)
+    ok = 1
+}
+
+type ObjStat struct { size int  content_type string }
+
+// obj_stat is HEAD's backing query — metadata only, never reads the blob file.
+func obj_stat(data, bucket, key) (size, ct, ok) {
+    ok = 0
+    ct = ""
+    size = 0
+    bdir := bucket_dir(data, bucket)
+    if !is_dir(bdir) { return }
+    idxdb := sqlite_open(bdir + "/index.db")
+    rows := sqlite_query(idxdb, "SELECT size, content_type FROM objects WHERE key=?", []string{key})
+    sqlite_close(idxdb)
+    list := parse(rows, []ObjStat{})
+    if len(list) == 0 { return }
+    size = list[0].size
+    ct = list[0].content_type
+    ok = 1
+}
+
+func obj_get(data, bucket, key) (raw, ct, ok) {
+    ok = 0
+    ct = ""
+    raw = bytes("")
+    bdir := bucket_dir(data, bucket)
+    if !is_dir(bdir) { return }
+    idxdb := sqlite_open(bdir + "/index.db")
+    rows := sqlite_query(idxdb, "SELECT sha, content_type FROM objects WHERE key=?", []string{key})
+    sqlite_close(idxdb)
+    list := parse(rows, []ObjMeta{})
+    if len(list) == 0 { return }
+    raw = read_file_bytes(blob_shard_path(bdir, list[0].sha))
+    ct = list[0].content_type
+    ok = 1
+}
+
+func obj_delete(data, bucket, key) (ok) {
+    ok = 0
+    bdir := bucket_dir(data, bucket)
+    if !is_dir(bdir) { return }
+    idxdb := sqlite_open(bdir + "/index.db")
+    rows := sqlite_query(idxdb, "SELECT sha FROM objects WHERE key=?", []string{key})
+    list := parse(rows, []ShaRow{})
+    if len(list) == 0 { sqlite_close(idxdb)  return }
+    sqlite_exec(idxdb, "DELETE FROM objects WHERE key=?", []string{key})
+    blob_ref_dec(bdir, idxdb, list[0].sha)
+    sqlite_close(idxdb)
+    ok = 1
+}
+
+// obj_list_body lists keys (optionally filtered by a literal prefix — a "%"
+// or "_" in prefix is a SQL LIKE wildcard, not escaped in Phase 1).
+func obj_list_body(data, bucket, prefix) (body, ok) {
+    ok = 0
+    body = ""
+    bdir := bucket_dir(data, bucket)
+    if !is_dir(bdir) { return }
+    idxdb := sqlite_open(bdir + "/index.db")
+    rows := ""
+    if prefix == "" {
+        rows = sqlite_query(idxdb, "SELECT key, sha, size, content_type, created_at FROM objects ORDER BY key")
+    } else {
+        rows = sqlite_query(idxdb, "SELECT key, sha, size, content_type, created_at FROM objects WHERE key LIKE ? ORDER BY key", []string{prefix + "%"})
+    }
+    sqlite_close(idxdb)
+    body = "\"bucket\":\"" + bucket + "\",\"items\":" + rows
+    ok = 1
+}

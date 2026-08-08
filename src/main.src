@@ -1,0 +1,104 @@
+// main.src — the agent-first CLI. stdout = JSON answer; stderr = structured
+// error; semantic exit codes (0 ok · 80-89 input · 90-99 resource · 100-109
+// integration · 110-119 internal). `help-json` is the self-describing
+// catalog an agent reads first. Same contract as machin-vault.
+
+func emit(body) { println("{\"version\":\"1\",\"ok\":true," + body + "}") }
+func die(code, msg) { write(2, "{\"version\":\"1\",\"ok\":false,\"error\":" + json(msg) + "}\n")  exit(code) }
+
+func arg_at(rest, i) (s) {
+    s = ""
+    if i < len(rest) { s = rest[i] }
+}
+
+func print_help_json() {
+    println("{\"version\":\"1\",\"ok\":true,\"tool\":\"machin-esetres\"," +
+        "\"summary\":\"self-hosted object store: buckets, sha256-deduped objects, bearer-token HTTP API\"," +
+        "\"commands\":[" +
+        "{\"name\":\"bucket create\",\"args\":\"<name>\",\"desc\":\"create a bucket, print its bearer token (shown once, in full, here only)\"}," +
+        "{\"name\":\"bucket list\",\"args\":\"\",\"desc\":\"list buckets with masked tokens\"}," +
+        "{\"name\":\"put\",\"args\":\"<bucket> <key> <file>\",\"desc\":\"upload a file; deduped by sha256\"}," +
+        "{\"name\":\"get\",\"args\":\"<bucket> <key> --to <file>\",\"desc\":\"download an object to a file\"}," +
+        "{\"name\":\"rm\",\"args\":\"<bucket> <key>\",\"desc\":\"delete an object (refcount-aware blob cleanup)\"}," +
+        "{\"name\":\"ls\",\"args\":\"<bucket> [--prefix p]\",\"desc\":\"list objects, optionally filtered by key prefix\"}," +
+        "{\"name\":\"serve\",\"args\":\"--port N\",\"desc\":\"run the HTTP API\"}" +
+        "]," +
+        "\"flags\":[\"--data/-d <dir> (default data)\",\"--to <file>\",\"--content-type <ct>\",\"--prefix <p>\",\"--port/-p <n> (default 9000)\"]," +
+        "\"http_api\":\"PUT/GET/HEAD/DELETE /b/<bucket>/o/<key> + GET /b/<bucket>?prefix=<p>, Authorization: Bearer <bucket token>\"," +
+        "\"exit_codes\":\"0 ok | 80-89 input | 90-99 resource(not found) | 100-109 integration | 110-119 internal\"}")
+}
+
+func cmd_bucket_create(data, name) {
+    if name == "" { die(80, "bucket create requires <name>") }
+    token, ok := bucket_create(data, name)
+    if ok == 0 { die(90, "bucket already exists: " + name) }
+    emit("\"bucket\":\"" + name + "\",\"token\":\"" + token + "\",\"note\":\"store this token now — it will not be shown in full again\"")
+}
+
+func cmd_bucket_list(data) { emit(bucket_list_body(data)) }
+
+func cmd_put(data, bucket, key, file, ctype) {
+    if bucket == "" || key == "" || file == "" { die(80, "put requires <bucket> <key> <file>") }
+    kind, _, _ := stat(file)
+    if kind != 1 { die(80, "not a file: " + file) }
+    raw := read_file_bytes(file)
+    ct := ctype
+    if ct == "" { ct = "application/octet-stream" }
+    sha, size, ok := obj_put(data, bucket, key, raw, ct)
+    if ok == 0 { die(90, "no such bucket: " + bucket) }
+    emit("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"sha256\":\"" + sha + "\",\"size\":" + str(size))
+}
+
+func cmd_get(data, bucket, key, to) {
+    if bucket == "" || key == "" { die(80, "get requires <bucket> <key>") }
+    if to == "" { die(80, "get requires --to <file>") }
+    raw, ct, ok := obj_get(data, bucket, key)
+    if ok == 0 { die(90, "not found: " + bucket + "/" + key) }
+    write_file_bytes(to, raw)
+    emit("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"path\":" + json(to) + ",\"content_type\":" + json(ct) + ",\"size\":" + str(len(raw)))
+}
+
+func cmd_rm(data, bucket, key) {
+    if bucket == "" || key == "" { die(80, "rm requires <bucket> <key>") }
+    ok := obj_delete(data, bucket, key)
+    if ok == 0 { die(90, "not found: " + bucket + "/" + key) }
+    emit("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"deleted\":true")
+}
+
+func cmd_ls(data, bucket, prefix) {
+    if bucket == "" { die(80, "ls requires <bucket>") }
+    body, ok := obj_list_body(data, bucket, prefix)
+    if ok == 0 { die(90, "no such bucket: " + bucket) }
+    emit(body)
+}
+
+func main() {
+    fs := new_flags("machin-esetres")
+    fs = flag_str(fs, "data", "d", "data", "data directory")
+    fs = flag_str(fs, "to", "", "", "output file (get)")
+    fs = flag_str(fs, "content-type", "", "", "content type (put)")
+    fs = flag_str(fs, "prefix", "", "", "key prefix filter (ls)")
+    fs = flag_int(fs, "port", "p", "9000", "serve port")
+    fs = parse_flags(fs, args())
+    rest := flag_args(fs)
+    cmd := arg_at(rest, 0)
+    data := flag_get(fs, "data")
+
+    if cmd == "" { print_help_json()  return }
+    if cmd == "help" { print_help_json()  return }
+    if cmd == "help-json" { print_help_json()  return }
+
+    if cmd == "bucket" {
+        sub := arg_at(rest, 1)
+        if sub == "create" { cmd_bucket_create(data, arg_at(rest, 2))  return }
+        if sub == "list" { cmd_bucket_list(data)  return }
+        die(80, "unknown bucket subcommand: " + sub)
+        return
+    }
+    if cmd == "put" { cmd_put(data, arg_at(rest, 1), arg_at(rest, 2), arg_at(rest, 3), flag_get(fs, "content-type"))  return }
+    if cmd == "get" { cmd_get(data, arg_at(rest, 1), arg_at(rest, 2), flag_get(fs, "to"))  return }
+    if cmd == "rm" { cmd_rm(data, arg_at(rest, 1), arg_at(rest, 2))  return }
+    if cmd == "ls" { cmd_ls(data, arg_at(rest, 1), flag_get(fs, "prefix"))  return }
+    if cmd == "serve" { serve_app(data, flag_int_val(fs, "port"))  return }
+    die(80, "unknown command: " + cmd + " (try help-json)")
+}

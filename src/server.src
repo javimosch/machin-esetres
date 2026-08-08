@@ -1,0 +1,104 @@
+// server.src — the HTTP API. Every route reuses store.src's core functions
+// (never die()/exit()s), so a bad request 4xx's, it never kills the daemon.
+// Auth: Authorization: Bearer <token> — one token per bucket (resolve_bucket_token).
+
+func wrap(body) (s) { s = "{\"version\":\"1\",\"ok\":true," + body + "}" }
+
+func unauthorized() (r) {
+    r = response("401 Unauthorized", "application/json", "{\"version\":\"1\",\"ok\":false,\"error\":\"missing or invalid bearer token\"}")
+}
+
+func check_bearer(req, want) (ok) {
+    ok = 0
+    auth := header(req, "authorization")
+    if has_prefix(auth, "Bearer ") {
+        tok := trim(substr(auth, 7, len(auth)))
+        if tok == want { ok = 1 }
+    }
+}
+
+func path_no_query(path) (p) {
+    p = path
+    qi := index(path, "?")
+    if qi >= 0 { p = substr(path, 0, qi) }
+}
+
+// split_bucket_key parses "/b/<bucket>" or "/b/<bucket>/o/<key...>" (keys may
+// contain slashes, like S3 keys — hence a manual split rather than the map
+// router, which only matches exact paths).
+func split_bucket_key(path) (bucket, key, has_key) {
+    bucket = ""
+    key = ""
+    has_key = 0
+    p := path_no_query(path)
+    if !has_prefix(p, "/b/") { return }
+    tail := substr(p, 3, len(p))
+    si := index(tail, "/")
+    if si < 0 { bucket = tail  return }
+    bucket = substr(tail, 0, si)
+    rest := substr(tail, si + 1, len(tail))
+    if has_prefix(rest, "o/") {
+        key = substr(rest, 2, len(rest))
+        has_key = 1
+    }
+}
+
+func handle(data, req) (res) {
+    if req.path == "/healthz" { res = ok_json("{\"ok\":true}")  return }
+
+    bucket, key, has_key := split_bucket_key(req.path)
+    if bucket == "" { res = not_found()  return }
+    token, tok_ok := resolve_bucket_token(data, bucket)
+    if tok_ok == 0 { res = not_found()  return }
+    if check_bearer(req, token) == 0 { res = unauthorized()  return }
+
+    if has_key == 0 {
+        if req.method == "GET" {
+            body, ok := obj_list_body(data, bucket, query(req, "prefix"))
+            if ok == 0 { res = not_found()  return }
+            res = ok_json(wrap(body))
+            return
+        }
+        res = not_found()
+        return
+    }
+
+    if req.method == "PUT" {
+        ct := header(req, "content-type")
+        if ct == "" { ct = "application/octet-stream" }
+        sha, size, ok := obj_put(data, bucket, key, req.body_bytes, ct)
+        if ok == 0 { res = not_found()  return }
+        res = created(wrap("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"sha256\":\"" + sha + "\",\"size\":" + str(size)))
+        return
+    }
+    if req.method == "GET" {
+        raw, ct, ok := obj_get(data, bucket, key)
+        if ok == 0 { res = not_found()  return }
+        res = ok_bytes(ct, raw)
+        return
+    }
+    if req.method == "HEAD" {
+        // Metadata as JSON, not a bodyless response shaped like the real
+        // object: machweb computes Content-Length from the response body
+        // it's actually writing, so faking an empty-body 200 for a non-empty
+        // object would mean either a wrong (0) Content-Length or a second,
+        // conflicting one — both invalid HTTP. Real HEAD semantics are a
+        // Phase 2 (S3-compatible facade) concern.
+        size, ct, ok := obj_stat(data, bucket, key)
+        if ok == 0 { res = not_found()  return }
+        res = ok_json(wrap("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"size\":" + str(size) + ",\"content_type\":" + json(ct)))
+        return
+    }
+    if req.method == "DELETE" {
+        ok := obj_delete(data, bucket, key)
+        if ok == 0 { res = not_found()  return }
+        res = ok_json(wrap("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"deleted\":true"))
+        return
+    }
+    res = not_found()
+}
+
+func serve_app(data, port) {
+    println("machin-esetres serving on :" + str(port) + "  (data " + data + ")")
+    serve(port, func(req) { return handle(data, req) })
+}
