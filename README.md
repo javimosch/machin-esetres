@@ -28,10 +28,10 @@ directory.
 
 ## Status
 
-**Phase 1 is built and passing its smoke test** (`./smoke.sh`): buckets,
-sha256-deduped objects with refcounted delete, bearer-token HTTP API
-(PUT/GET/HEAD/DELETE + prefix list), and the CLI, all in one native binary.
-Not yet deployed to rbm21 or wired into poche-resend-webmail — see
+**Phase 1 and Phase 2 are both built and passing `./smoke.sh`** — including a
+Phase 2 run against a genuine `aws-cli` (real independent SigV4 signing, not
+our own signer testing our own verifier). Deployed and running on rbm21 (see
+"Where it runs" below). Not yet wired into poche-resend-webmail itself — see
 [AGENTS.md](AGENTS.md) for the open questions and next steps.
 
 ## The plan, in short
@@ -42,25 +42,29 @@ Not yet deployed to rbm21 or wired into poche-resend-webmail — see
   — binary-safe request bodies, streaming responses, routing; no new framework
   needed). Fixes the actual problem: attachments get a real API, sha256-based
   dedup, and a host independent of poche-resend-webmail's own disk.
-- **Phase 2 — a real S3-compatible facade.** AWS SigV4 request signing + the
-  actual S3 REST API shape on top of the same bucket/key/object model, so
-  `aws-cli`, `mc`, `rclone`, and any S3 SDK work against it unmodified — a real
-  MinIO alternative, not just an S3-flavored API. Deferred behind Phase 1
-  because SigV4 is a serious chunk of work and isn't needed for
-  poche-resend-webmail itself, but it's a committed roadmap item, not a maybe.
+- **Phase 2 — a real S3-compatible facade. Done.** AWS SigV4 request
+  verification (pure MFL over `hmac_sha256_bytes`/`sha256_bytes` — no new
+  machin builtin needed) + path-style S3 routing + XML responses over the
+  same bucket/key/object model. Verified against real `aws-cli`: `s3 cp`
+  (upload + download), `s3 ls`, `s3 rm`, `s3api head-object`, and rejection of
+  a wrong secret with the real `SignatureDoesNotMatch` error. See "Phase 2
+  scope limits" below for what's deliberately not covered yet.
 
 ## Where it runs
 
-**rbm21** (LXC on pve2, `100.123.0.125` over Tailscale) — a separate failure
-domain from dk1, where poche-resend-webmail actually runs. Reached over
-Tailscale, not exposed publicly (no reason for an internal object-storage
-backend to have a public hostname). `zig`/`gcc` are already present on rbm21,
-so it builds there directly.
+**Deployed** on rbm21 (LXC on pve2, `100.123.0.125` over Tailscale) — a
+separate failure domain from dk1, where poche-resend-webmail actually runs.
+Systemd unit `machin-esetres.service`, static binary at
+`/opt/machin-esetres/machin-esetres`, data at `/var/lib/machin-esetres/data`,
+port 9000, internal-only (no public Traefik route). Health-checked from both
+rbm21 itself and from dk1 over Tailscale. Full operational details —
+credentials handling, rebuild/redeploy steps, service control — live in
+`~/backups/machin-esetres/access.txt` (not in this repo, since it's
+host-specific and gitignored-adjacent by convention in this ecosystem).
 
-**Known constraint:** rbm21's root disk is at 76% (14G free) as of the design
-pass (2026-08-08). Fine for early KB–MB attachment traffic; needs a dedicated
-volume/mount before this holds real production data at any scale — a Phase 1
-prerequisite, not an afterthought.
+**Known constraint:** rbm21's root disk was at 76% (14G free) as of deploy
+(2026-08-08). Fine for early KB–MB attachment traffic; needs a dedicated
+volume/mount before this holds real production data at any scale.
 
 ## Data model (Phase 1)
 
@@ -131,6 +135,58 @@ AGENTS.md's non-goals).
 curl -H "Authorization: Bearer <token>" http://localhost:9000/b/mymailbox/o/hello.txt
 ```
 
+## Phase 2 — the S3-compatible facade (as built)
+
+Same buckets, same tokens, a second protocol front-end at path-style S3
+routes (not under `/b/` — anything else is routed here):
+
+```
+PUT    /<bucket>/<key>        upload (aws s3 cp / mc cp / any SDK put_object)
+GET    /<bucket>/<key>        download
+HEAD   /<bucket>/<key>        see "Phase 2 scope limits" — not spec-correct
+DELETE /<bucket>/<key>        delete
+GET    /<bucket>?list-type=2  ListObjectsV2 XML
+```
+
+Auth is AWS SigV4: **access_key_id = bucket name, secret_access_key = the
+bucket's token** (the same one `bucket create` printed). No separate
+credential store — set up an `aws-cli` profile or `mc alias` with those two
+values and a region of your choosing (this facade doesn't check it):
+
+```bash
+export AWS_ACCESS_KEY_ID=mymailbox
+export AWS_SECRET_ACCESS_KEY=<the token>
+export AWS_DEFAULT_REGION=us-east-1
+aws --endpoint-url http://<host>:9000 s3 cp ./file.pdf s3://mymailbox/attachments/1/file.pdf
+aws --endpoint-url http://<host>:9000 s3 ls s3://mymailbox/
+aws --endpoint-url http://<host>:9000 s3 cp s3://mymailbox/attachments/1/file.pdf ./out.pdf
+```
+
+Verified against a real `aws-cli` (not a hand-rolled test signer): upload,
+list, download (byte-identical), `s3api head-object`, and a wrong-secret
+request correctly rejected with AWS's own `SignatureDoesNotMatch` error.
+
+### Phase 2 scope limits (disclosed, not silently skipped)
+
+- **ETag is the object's sha256 hex**, not AWS's MD5 (or the multipart
+  composite format) — machin has no MD5 builtin. Most clients treat ETag as
+  an opaque change-token; a strict byte-for-byte MD5 comparison would fail.
+- **HEAD is not spec-correct.** `machweb` cannot send a non-zero
+  Content-Length with a genuinely empty body (see the Phase 1 HEAD note
+  above — same root cause), so Phase 2's HEAD sends the same body a GET
+  would. Most client libraries tolerate this (they trust Content-Length and
+  don't read further); a strict one might not. `aws s3api head-object`
+  works because botocore only looks at headers.
+- **Header-based SigV4 only** — no presigned URLs (`mc share` / `aws s3
+  presign` links won't verify) and no `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
+  (chunked signing, used by some SDKs for large uploads by default).
+- **No X-Amz-Date freshness check** — a captured, replayed request would
+  still verify. Acceptable given this sits behind Tailscale, not the public
+  internet; would need fixing before broader exposure.
+- **Bucket create/delete is CLI-only**, same as Phase 1 — `aws s3 mb` / `mc
+  mb` fail with a 501 pointing at `machin-esetres bucket create`.
+- Signature comparison is a plain string `==`, not constant-time.
+
 ## What this does *not* fix
 
 Inbound mail attachment content (Resend's webhook payload carries no bytes/URL
@@ -151,14 +207,21 @@ password hashing) — so if large-object support becomes a real requirement,
 that's a machweb streaming-body feature to drive, not a machin-esetres
 workaround to invent.
 
-## Layout (once Phase 1 code exists)
+## Layout
 
 ```
 machin-esetres/
-├── esetres.src     # CLI + HTTP server (MFL)
-├── flags.src       # vendored flag parser (canonical copy in machin/framework/)
-├── build.sh
-├── smoke.sh
+├── src/
+│   ├── store.src    # core: buckets, sha256-deduped objects, refcounted delete —
+│   │                #   shared by the CLI and both HTTP front-ends, never die()s
+│   ├── sigv4.src     # AWS SigV4 request verification (Phase 2)
+│   ├── s3.src         # S3-compatible facade: path-style routing, XML, SigV4 auth
+│   ├── server.src    # Phase 1 custom REST API (machweb wiring)
+│   └── main.src       # CLI dispatch (bucket/put/get/rm/ls/serve), agent-first
+│                       #   contract (emit/die, exit codes)
+├── build.sh          # machin encode (framework/flags + framework/machweb
+│                       #   resolve from the compiler — nothing vendored) + build
+├── smoke.sh          # CLI + Phase 1 HTTP + Phase 2 (real aws-cli) regression test
 ├── README.md
-└── AGENTS.md
+└── AGENTS.md         # architecture, decisions, open questions, verified claims
 ```

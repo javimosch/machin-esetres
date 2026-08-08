@@ -9,7 +9,7 @@ command -v "$MACHIN" >/dev/null 2>&1 || { echo "error: '$MACHIN' not found (set 
 
 "$MACHIN" encode \
     framework/flags.src framework/machweb.src \
-    src/store.src src/server.src src/main.src \
+    src/store.src src/sigv4.src src/s3.src src/server.src src/main.src \
     > esetres.mfl
 
 "$MACHIN" build esetres.mfl -o machin-esetres

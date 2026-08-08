@@ -1,0 +1,144 @@
+// s3.src — the Phase 2 S3-compatible facade: path-style routing
+// (/<bucket>/<key>, not Phase 1's /b/<bucket>/o/<key>), SigV4 auth, and XML
+// request/response bodies, so aws-cli/mc/rclone/any S3 SDK can talk to the
+// same buckets Phase 1's custom REST API and CLI already manage.
+//
+// Reuses store.src's core functions unchanged — this is a second protocol
+// front-end over the same object model, not a second storage engine.
+//
+// KNOWN DEVIATIONS FROM REAL S3 (disclosed, not silently papered over):
+//   - ETag is the object's sha256 hex, quoted — not AWS's MD5 (or the
+//     multipart composite format). Most clients treat ETag as an opaque
+//     change-token; a strict MD5 comparison would need an MD5 builtin machin
+//     doesn't have.
+//   - HEAD returns the real headers but — see the platform-constraint note
+//     in server.src's Phase 1 HEAD handler — machweb cannot send a non-zero
+//     Content-Length with a genuinely empty body. Phase 2's HEAD therefore
+//     sends the SAME body a GET would (functionally a GET under the HEAD
+//     method), which most client libraries tolerate (they trust
+//     Content-Length and simply don't read further) but is not spec-correct.
+//   - Bucket creation/deletion via the S3 API (PUT/DELETE on the bucket
+//     itself) is not implemented — same Phase 1 decision, buckets are
+//     CLI-only. `aws s3 mb` / `mc mb` against this facade will fail; create
+//     the bucket with `machin-esetres bucket create` first.
+//   - ListObjectsV2 only (no ListObjects v1, no pagination/continuation
+//     token — see store.src's obj_list_body limits).
+
+func xml_esc(s) (o) {
+    o = replace(s, "&", "&amp;")
+    o = replace(o, "<", "&lt;")
+    o = replace(o, ">", "&gt;")
+}
+
+func s3_error(status, code, message, resource) (r) {
+    body := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>" + code + "</Code><Message>" +
+        xml_esc(message) + "</Message><Resource>" + xml_esc(resource) + "</Resource></Error>"
+    r = response(status, "application/xml", body)
+}
+
+func s3_forbidden(msg) (r) { r = s3_error("403 Forbidden", "SignatureDoesNotMatch", msg, "") }
+func s3_no_such_bucket(name) (r) { r = s3_error("404 Not Found", "NoSuchBucket", "The specified bucket does not exist", name) }
+func s3_no_such_key(name) (r) { r = s3_error("404 Not Found", "NoSuchKey", "The specified key does not exist", name) }
+
+// split_s3_bucket_key parses path-style S3 routing: "/<bucket>" or
+// "/<bucket>/<key...>" (path_no_query is defined in server.src — one
+// namespace across the composed build, no need to redefine it here).
+func split_s3_bucket_key(path) (bucket, key, has_key) {
+    bucket = ""
+    key = ""
+    has_key = 0
+    p := path_no_query(path)
+    if !has_prefix(p, "/") { return }
+    tail := substr(p, 1, len(p))
+    if tail == "" { return }
+    si := index(tail, "/")
+    if si < 0 { bucket = tail  return }
+    bucket = substr(tail, 0, si)
+    key = substr(tail, si + 1, len(tail))
+    if key != "" { has_key = 1 }
+}
+
+type S3ListItem struct { key string  sha string  size int  content_type string  created_at int }
+
+// s3_list_xml re-runs the same query obj_list_body does (rather than parsing
+// its JSON back apart) and renders ListObjectsV2 XML from it directly.
+func s3_list_xml(data, bucket, prefix) (xml, ok) {
+    ok = 0
+    xml = ""
+    bdir := bucket_dir(data, bucket)
+    if !is_dir(bdir) { return }
+    idxdb := sqlite_open(bdir + "/index.db")
+    rows := ""
+    if prefix == "" {
+        rows = sqlite_query(idxdb, "SELECT key, sha, size, content_type, created_at FROM objects ORDER BY key")
+    } else {
+        rows = sqlite_query(idxdb, "SELECT key, sha, size, content_type, created_at FROM objects WHERE key LIKE ? ORDER BY key", []string{prefix + "%"})
+    }
+    sqlite_close(idxdb)
+    items := parse(rows, []S3ListItem{})
+    contents := ""
+    for _, it := range items {
+        lm := time_format_utc(it.created_at, "%Y-%m-%dT%H:%M:%S") + ".000Z"
+        contents = contents + "<Contents><Key>" + xml_esc(it.key) + "</Key><LastModified>" + lm +
+            "</LastModified><ETag>&quot;" + it.sha + "&quot;</ETag><Size>" + str(it.size) +
+            "</Size><StorageClass>STANDARD</StorageClass></Contents>"
+    }
+    xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" +
+        "<Name>" + xml_esc(bucket) + "</Name><Prefix>" + xml_esc(prefix) + "</Prefix>" +
+        "<KeyCount>" + str(len(items)) + "</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>" +
+        contents + "</ListBucketResult>"
+    ok = 1
+}
+
+func s3_handle(data, req) (res) {
+    bucket, key, has_key := split_s3_bucket_key(req.path)
+    if bucket == "" { res = s3_error("400 Bad Request", "InvalidArgument", "no bucket in path", "")  return }
+
+    secret, tok_ok := resolve_bucket_token(data, bucket)
+    if tok_ok == 0 { res = s3_no_such_bucket(bucket)  return }
+
+    access_key, sig_ok := sigv4_verify(req, path_no_query(req.path), secret)
+    if sig_ok == 0 { res = s3_forbidden("signature verification failed")  return }
+    if access_key != bucket { res = s3_forbidden("credential does not match bucket")  return }
+
+    if has_key == 0 {
+        if req.method == "GET" {
+            xml, ok := s3_list_xml(data, bucket, query(req, "prefix"))
+            if ok == 0 { res = s3_no_such_bucket(bucket)  return }
+            res = response("200 OK", "application/xml", xml)
+            return
+        }
+        // PUT/DELETE on the bucket itself (create/remove bucket) — CLI-only, see file header.
+        res = s3_error("501 Not Implemented", "NotImplemented", "bucket create/delete is CLI-only: machin-esetres bucket create <name>", bucket)
+        return
+    }
+
+    if req.method == "PUT" {
+        ct := header(req, "content-type")
+        if ct == "" { ct = "application/octet-stream" }
+        sha, _, ok := obj_put(data, bucket, key, req.body_bytes, ct)
+        if ok == 0 { res = s3_no_such_bucket(bucket)  return }
+        res = with_header(response("200 OK", ct, ""), "ETag", "\"" + sha + "\"")
+        return
+    }
+    if req.method == "GET" || req.method == "HEAD" {
+        // HEAD: see the file header note — this sends the same body a GET
+        // would (a documented deviation from spec-correct empty-body HEAD).
+        // Last-Modified matters more than it looks: aws-cli's high-level
+        // `s3 cp` download calls HeadObject first and hard-fails parsing the
+        // response if this header is absent (caught by testing a real
+        // `aws s3 cp` download, not assumed).
+        raw, ct, sha, created_at, ok := obj_get(data, bucket, key)
+        if ok == 0 { res = s3_no_such_key(key)  return }
+        lm := time_format_utc(created_at, "%a, %d %b %Y %H:%M:%S GMT")
+        res = with_header(with_header(ok_bytes(ct, raw), "ETag", "\"" + sha + "\""), "Last-Modified", lm)
+        return
+    }
+    if req.method == "DELETE" {
+        ok := obj_delete(data, bucket, key)
+        if ok == 0 { res = s3_no_such_key(key)  return }
+        res = response("204 No Content", "", "")
+        return
+    }
+    res = s3_error("405 Method Not Allowed", "MethodNotAllowed", req.method + " is not supported", key)
+}

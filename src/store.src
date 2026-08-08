@@ -13,7 +13,7 @@
 //   <data>/<bucket>/objects/<sha[0:2]>/<sha[2:4]>/<sha> the blob, content-addressed
 
 type ShaRow struct { sha string }
-type ObjMeta struct { sha string  content_type string }
+type ObjMeta struct { sha string  content_type string  created_at int }
 type BlobRow struct { sha string  refcount int }
 type BucketRow struct { name string  token string  created_at int }
 type TokenRow struct { token string }
@@ -172,18 +172,25 @@ func obj_stat(data, bucket, key) (size, ct, ok) {
     ok = 1
 }
 
-func obj_get(data, bucket, key) (raw, ct, ok) {
+// obj_get returns sha + created_at alongside the bytes (already known from
+// the index lookup) so a caller building an ETag/Last-Modified doesn't have
+// to re-hash the body or run a second query.
+func obj_get(data, bucket, key) (raw, ct, sha, created_at, ok) {
     ok = 0
     ct = ""
+    sha = ""
+    created_at = 0
     raw = bytes("")
     bdir := bucket_dir(data, bucket)
     if !is_dir(bdir) { return }
     idxdb := sqlite_open(bdir + "/index.db")
-    rows := sqlite_query(idxdb, "SELECT sha, content_type FROM objects WHERE key=?", []string{key})
+    rows := sqlite_query(idxdb, "SELECT sha, content_type, created_at FROM objects WHERE key=?", []string{key})
     sqlite_close(idxdb)
     list := parse(rows, []ObjMeta{})
     if len(list) == 0 { return }
-    raw = read_file_bytes(blob_shard_path(bdir, list[0].sha))
+    sha = list[0].sha
+    created_at = list[0].created_at
+    raw = read_file_bytes(blob_shard_path(bdir, sha))
     ct = list[0].content_type
     ok = 1
 }

@@ -52,7 +52,7 @@ func cmd_put(data, bucket, key, file, ctype) {
 func cmd_get(data, bucket, key, to) {
     if bucket == "" || key == "" { die(80, "get requires <bucket> <key>") }
     if to == "" { die(80, "get requires --to <file>") }
-    raw, ct, ok := obj_get(data, bucket, key)
+    raw, ct, _, _, ok := obj_get(data, bucket, key)
     if ok == 0 { die(90, "not found: " + bucket + "/" + key) }
     write_file_bytes(to, raw)
     emit("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"path\":" + json(to) + ",\"content_type\":" + json(ct) + ",\"size\":" + str(len(raw)))

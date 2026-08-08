@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Smoke: CLI (bucket/put/get/rm/ls, dedup + refcounted delete) + HTTP API
-# (auth, PUT/GET/HEAD/DELETE/list, 401/404). Builds first so this always
-# tests the binary that would actually ship.
+# Smoke: CLI (bucket/put/get/rm/ls, dedup + refcounted delete) + Phase 1 HTTP
+# API (auth, PUT/GET/HEAD/DELETE/list, 401/404) + Phase 2 S3 facade against a
+# REAL aws-cli (SigV4 signing done by an independent implementation, not our
+# own signer testing our own verifier — skipped if aws-cli isn't installed).
+# Builds first so this always tests the binary that would actually ship.
 set -euo pipefail
 cd "$(dirname "$0")"
 ./build.sh
@@ -79,4 +81,34 @@ curl -sf -X DELETE -H "Authorization: Bearer $TOKEN2" "http://127.0.0.1:$PORT/b/
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN2" "http://127.0.0.1:$PORT/b/httptest/o/hello.txt")
 test "$code" = "404"
 
-echo "OK machin-esetres smoke"
+# ---- Phase 2: the S3 facade, driven by a REAL aws-cli (independent SigV4) ----
+if command -v aws >/dev/null 2>&1; then
+    out=$($BIN bucket create s3test); TOKEN3=$(echo "$out" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    export AWS_ACCESS_KEY_ID=s3test
+    export AWS_SECRET_ACCESS_KEY="$TOKEN3"
+    export AWS_DEFAULT_REGION=us-east-1
+    ENDPOINT="http://127.0.0.1:$PORT"
+
+    aws --endpoint-url "$ENDPOINT" s3 cp "$FILE" s3://s3test/hello.txt >/dev/null
+    aws --endpoint-url "$ENDPOINT" s3 ls s3://s3test/ | grep -q hello.txt
+    OUTFILE3=$(mktemp /tmp/machin-esetres-smoke-out3-XXXX)
+    aws --endpoint-url "$ENDPOINT" s3 cp s3://s3test/hello.txt "$OUTFILE3" >/dev/null
+    diff "$FILE" "$OUTFILE3"
+    rm -f "$OUTFILE3"
+
+    aws --endpoint-url "$ENDPOINT" s3api head-object --bucket s3test --key hello.txt | grep -q '"ContentLength"'
+
+    set +e
+    AWS_SECRET_ACCESS_KEY=wrongsecret aws --endpoint-url "$ENDPOINT" s3 ls s3://s3test/ >/dev/null 2>/tmp/machin-esetres-smoke-awserr
+    wrong_code=$?
+    set -e
+    test "$wrong_code" != "0"
+    grep -q SignatureDoesNotMatch /tmp/machin-esetres-smoke-awserr
+    rm -f /tmp/machin-esetres-smoke-awserr
+
+    aws --endpoint-url "$ENDPOINT" s3 rm s3://s3test/hello.txt >/dev/null
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
+    echo "OK machin-esetres smoke (Phase 1 + Phase 2 / real aws-cli)"
+else
+    echo "OK machin-esetres smoke (Phase 1 only — aws-cli not installed, Phase 2 skipped)"
+fi

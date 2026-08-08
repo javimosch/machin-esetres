@@ -1,0 +1,131 @@
+// sigv4.src — AWS Signature Version 4 request verification, so real S3
+// clients (aws-cli, mc, rclone, any SDK) can authenticate against the S3
+// facade (s3.src) the same way they'd authenticate against AWS or MinIO.
+// Pure MFL over the crypto builtins already in machin (hmac_sha256_bytes,
+// sha256_bytes) — no new machin feature needed.
+//
+// Access key = bucket name, secret key = the bucket's existing bearer token
+// (the same one Phase 1's custom REST API uses) — one identity per bucket,
+// no separate credential store.
+//
+// KNOWN SCOPE LIMITS (documented, not silently skipped):
+//   - Header-based SigV4 only. Presigned-URL (query-string) SigV4 is not
+//     implemented — `mc share` / `aws s3 presign` links won't verify.
+//   - STREAMING-AWS4-HMAC-SHA256-PAYLOAD (chunked signing, used by some SDKs
+//     for large uploads) is not implemented — only a single up-front payload
+//     hash (or UNSIGNED-PAYLOAD) is understood. A client that chunk-signs by
+//     default will fail to authenticate; most CLIs have a flag or version
+//     where they don't for ordinary `cp`/`put`.
+//   - No X-Amz-Date freshness/replay-window check (real AWS/MinIO reject a
+//     request outside ~15 minutes of clock skew). This facade sits behind
+//     Tailscale, not the public internet — signature validity is checked in
+//     full; the timestamp just isn't independently re-verified against wall
+//     clock. Add it if this is ever exposed more broadly.
+//   - Signature comparison is a plain string ==, not constant-time.
+
+// sigv4_parse_auth splits an "AWS4-HMAC-SHA256 Credential=.../SignedHeaders=.../Signature=..."
+// header into its parts. ok=0 on anything malformed.
+func sigv4_parse_auth(auth) (access_key, date8, region, signed_headers, signature, ok) {
+    access_key = ""
+    date8 = ""
+    region = ""
+    signed_headers = ""
+    signature = ""
+    ok = 0
+    if !has_prefix(auth, "AWS4-HMAC-SHA256 ") { return }
+    rest := substr(auth, len("AWS4-HMAC-SHA256 "), len(auth))
+    cred := ""
+    for _, raw := range split(rest, ",") {
+        f := trim(raw)
+        if has_prefix(f, "Credential=") { cred = substr(f, len("Credential="), len(f)) }
+        if has_prefix(f, "SignedHeaders=") { signed_headers = substr(f, len("SignedHeaders="), len(f)) }
+        if has_prefix(f, "Signature=") { signature = substr(f, len("Signature="), len(f)) }
+    }
+    if cred == "" || signed_headers == "" || signature == "" { return }
+    parts := split(cred, "/")
+    if len(parts) < 5 { return }
+    access_key = parts[0]
+    date8 = parts[1]
+    region = parts[2]
+    // parts[3] is expected to be "s3", parts[4] "aws4_request" — not required
+    // to match for this self-hosted facade (there's only one service/scope).
+    ok = 1
+}
+
+// sigv4_canonical_query sorts a raw (still percent-encoded) query string's
+// "&"-delimited fields lexicographically, per the SigV4 canonicalization
+// rule — AWS's own examples build this from the still-encoded fragments.
+func sigv4_canonical_query(path) (cqs) {
+    cqs = ""
+    qi := index(path, "?")
+    if qi < 0 { return }
+    q := substr(path, qi+1, len(path))
+    if q == "" { return }
+    cqs = join(sort(split(q, "&")), "&")
+}
+
+// sigv4_canonical_headers builds the CanonicalHeaders + SignedHeaders block
+// for exactly the headers the client listed (already lowercase, ";"-joined,
+// already sorted by a compliant client — trusted as given, matching the
+// signer's own input).
+func sigv4_canonical_headers(req, signed_headers) (block) {
+    block = ""
+    for _, name := range split(signed_headers, ";") {
+        block = block + name + ":" + trim(header(req, name)) + "\n"
+    }
+}
+
+// sigv4_payload_hash resolves the hashed-payload component: the client's own
+// x-amz-content-sha256 header if present (UNSIGNED-PAYLOAD or a real hex
+// digest), else a freshly computed sha256 of the actual body.
+func sigv4_payload_hash(req) (h) {
+    h = header(req, "x-amz-content-sha256")
+    if h == "" { h = to_hex(sha256_bytes(req.body_bytes)) }
+}
+
+// sigv4_verify checks a request's Authorization header against secret (the
+// bucket's token). Returns the Credential's access-key-id alongside ok, so
+// the caller can confirm it actually names the bucket in the URL (access_key
+// is otherwise just an opaque string here — the crypto check alone already
+// makes an access_key/secret mismatch fail, since two buckets never share a
+// token, but binding identity to the URL explicitly is cheap and clearer to
+// audit than relying on that as an implicit side effect).
+// ok=0 for ANY failure (malformed header, wrong signature) with no further
+// distinction — callers map that to a generic auth-denied response, same as
+// Phase 1's bearer-token check.
+func sigv4_verify(req, path_no_q, secret) (access_key, ok) {
+    ok = 0
+    access_key = ""
+    auth := header(req, "authorization")
+    ak, date8, region, signed_headers, signature, pok := sigv4_parse_auth(auth)
+    access_key = ak
+    if pok == 0 { return }
+
+    amz_date := header(req, "x-amz-date")
+    if amz_date == "" { return }
+
+    // Body integrity: if the client claims a real digest (not a sentinel),
+    // it must match what was actually received.
+    claimed := header(req, "x-amz-content-sha256")
+    if claimed != "" && claimed != "UNSIGNED-PAYLOAD" && !has_prefix(claimed, "STREAMING-") {
+        if claimed != to_hex(sha256_bytes(req.body_bytes)) { return }
+    }
+
+    canonical := req.method + "\n" +
+        path_no_q + "\n" +
+        sigv4_canonical_query(req.path) + "\n" +
+        sigv4_canonical_headers(req, signed_headers) + "\n" +
+        signed_headers + "\n" +
+        sigv4_payload_hash(req)
+
+    scope := date8 + "/" + region + "/s3/aws4_request"
+    string_to_sign := "AWS4-HMAC-SHA256\n" + amz_date + "\n" + scope + "\n" + to_hex(sha256_bytes(bytes(canonical)))
+
+    k_date := hmac_sha256_bytes(bytes("AWS4" + secret), bytes(date8))
+    k_region := hmac_sha256_bytes(k_date, bytes(region))
+    k_service := hmac_sha256_bytes(k_region, bytes("s3"))
+    k_signing := hmac_sha256_bytes(k_service, bytes("aws4_request"))
+    computed := to_hex(hmac_sha256_bytes(k_signing, bytes(string_to_sign)))
+
+    if computed == signature { ok = 1 }
+}
