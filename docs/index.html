@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>machin-esetres — a self-hosted object store in machin</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+    <style>
+      body { font-family: 'IBM Plex Mono', ui-monospace, monospace; background: #0b0f0c; color: #d7e0d9; }
+      h1, h2 { font-family: 'Syne', system-ui, sans-serif; }
+      .grain { background-image: radial-gradient(rgba(255,255,255,0.04) 0.5px, transparent 0.5px); background-size: 3px 3px; }
+    </style>
+  </head>
+  <body class="min-h-screen grain">
+    <div class="max-w-3xl mx-auto px-6 py-20">
+      <p class="text-emerald-400/80 text-xs tracking-[0.2em] uppercase mb-4">machin · MFL · sigv4</p>
+      <h1 class="text-6xl font-extrabold text-white tracking-tight">esetres</h1>
+      <p class="text-white/50 mt-4 text-lg leading-relaxed max-w-xl">
+        <em>"es-tres"</em> — as in S-3. A self-hosted object store in one static binary:
+        buckets, sha256-deduped objects, an agent-first CLI, and a real
+        <code class="text-emerald-300">aws-cli</code>-compatible S3 facade (AWS SigV4) — no MinIO, no Docker, no runtime.
+      </p>
+      <nav class="mt-10 flex flex-wrap gap-3">
+        <a href="https://github.com/javimosch/machin-esetres" class="px-5 py-2.5 rounded border border-white/15 text-white/80 text-sm hover:border-emerald-400/60 hover:text-emerald-300 transition">GitHub</a>
+        <a href="changelog.html" class="px-5 py-2.5 rounded border border-white/15 text-white/80 text-sm hover:border-emerald-400/60 hover:text-emerald-300 transition">Changelog</a>
+        <a href="https://github.com/javimosch/machin-esetres/blob/master/AGENTS.md" class="px-5 py-2.5 rounded border border-white/15 text-white/80 text-sm hover:border-emerald-400/60 hover:text-emerald-300 transition">Architecture &amp; decisions</a>
+        <a href="https://github.com/javimosch/machin" class="px-5 py-2.5 rounded border border-white/15 text-white/80 text-sm hover:border-emerald-400/60 hover:text-emerald-300 transition">machin</a>
+      </nav>
+      <pre class="mt-14 p-5 rounded-lg bg-black/50 border border-white/10 text-sm text-emerald-200/90 overflow-x-auto">machin-esetres bucket create mymailbox
+machin-esetres put mymailbox invoice.pdf ./invoice.pdf
+machin-esetres serve --port 9000
+
+# or, the same bucket, over real S3:
+export AWS_ACCESS_KEY_ID=mymailbox AWS_SECRET_ACCESS_KEY=&lt;token&gt;
+aws --endpoint-url http://localhost:9000 s3 cp ./invoice.pdf s3://mymailbox/invoice.pdf</pre>
+      <p class="mt-10 text-white/30 text-xs leading-relaxed max-w-xl">
+        Built to give <a href="https://github.com/javimosch/poche-resend-webmail" class="underline hover:text-emerald-300">poche-resend-webmail</a>'s
+        mail attachments a real home — deduplicated, off one app server's disk, with an API instead of a directory convention.
+        Verified against a genuine <code class="text-emerald-300/80">aws-cli</code>, not a signer testing itself.
+      </p>
+    </div>
+  </body>
+</html>
