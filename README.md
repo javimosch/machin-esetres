@@ -31,8 +31,13 @@ directory.
 **Phase 1 and Phase 2 are both built and passing `./smoke.sh`** — including a
 Phase 2 run against a genuine `aws-cli` (real independent SigV4 signing, not
 our own signer testing our own verifier). Deployed and running on rbm21 (see
-"Where it runs" below). Not yet wired into poche-resend-webmail itself — see
-[AGENTS.md](AGENTS.md) for the open questions and next steps.
+"Where it runs" below). **Coverage gate met**: 72.7% unit (`./test.sh`,
+32/44 functions, verified real by an intentional break-and-confirm-failure
+check) + 100% functional/smoke (`./smoke.sh`, 44/44 functions traced) — see
+AGENTS.md's "Coverage gate" section for the full methodology, since machin
+has no coverage-instrumentation tool to compute this automatically. Not yet
+wired into poche-resend-webmail itself — see [AGENTS.md](AGENTS.md) for the
+open questions and next steps.
 
 ## The plan, in short
 
@@ -217,10 +222,13 @@ machin-esetres/
 │   ├── sigv4.src     # AWS SigV4 request verification (Phase 2)
 │   ├── s3.src         # S3-compatible facade: path-style routing, XML, SigV4 auth
 │   ├── server.src    # Phase 1 custom REST API (machweb wiring)
-│   └── main.src       # CLI dispatch (bucket/put/get/rm/ls/serve), agent-first
-│                       #   contract (emit/die, exit codes)
+│   ├── main.src       # CLI dispatch (bucket/put/get/rm/ls/serve), agent-first
+│   │                   #   contract (emit/die, exit codes)
+│   └── test.src       # unit tests (98 assertions, no live process — Request/
+│                       #   Response are plain structs, built directly)
 ├── build.sh          # machin encode (framework/flags + framework/machweb
 │                       #   resolve from the compiler — nothing vendored) + build
+├── test.sh           # `machin test` over src/test.src — unit coverage
 ├── smoke.sh          # CLI + Phase 1 HTTP + Phase 2 (real aws-cli) regression test
 ├── README.md
 └── AGENTS.md         # architecture, decisions, open questions, verified claims

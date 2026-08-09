@@ -1,0 +1,308 @@
+// test.src — direct unit tests over store.src/sigv4.src/s3.src/server.src's
+// functions, run via `machin test` (framework/test.src's assert/assert_eq_*
+// + test_summary). Request/Response are plain structs, so almost every
+// function here is called directly with a constructed Request — no live
+// socket needed. The only functions that fundamentally can't be unit tested
+// this way are serve_app (starts a real listen loop) and main.src's CLI
+// entry points (read real argv) — those are covered by smoke.sh instead.
+//
+// Composed WITHOUT src/main.src on purpose: main.src defines its own main(),
+// which would collide with this file's. `machin test` already prepends
+// framework/test.src, so this file supplies the only main() in the build:
+//   machin test framework/flags.src framework/machweb.src \
+//     src/store.src src/sigv4.src src/s3.src src/server.src src/test.src
+//
+// sigv4_verify is checked against a signature this file derives itself,
+// independently re-deriving the AWS SigV4 steps from the spec rather than
+// calling sigv4.src's own canonical/signing helpers — so a bug shared
+// between the signer and the verifier wouldn't silently pass. The stronger,
+// ground-truth check remains smoke.sh's run against a genuine aws-cli.
+
+func mktmp() (dir) {
+    dir = "/tmp/esetres-test-" + to_hex(rand_bytes(6))
+}
+
+// MFL map literals don't take inline key/value pairs (only `{}` or `make`),
+// so these build a headers map for test Request fixtures.
+func h1(k1, v1) (h) {
+    h = make(map[string]string)
+    h[k1] = v1
+}
+
+func h2(k1, v1, k2, v2) (h) {
+    h = h1(k1, v1)
+    h[k2] = v2
+}
+
+func h3(k1, v1, k2, v2, k3, v3) (h) {
+    h = h2(k1, v1, k2, v2)
+    h[k3] = v3
+}
+
+func h4(k1, v1, k2, v2, k3, v3, k4, v4) (h) {
+    h = h3(k1, v1, k2, v2, k3, v3)
+    h[k4] = v4
+}
+
+// test_sign independently re-derives an AWS4-HMAC-SHA256 Authorization
+// header for a single fixed header set (host + x-amz-date) — a minimal,
+// from-spec re-implementation used only to build test fixtures, not shared
+// code with sigv4.src.
+func test_sign(method, path, access_key, secret, region, amzdate, date8, body) (auth) {
+    signed_headers := "host;x-amz-date"
+    canonical := method + "\n" + path + "\n" + "\n" + "host:example.com\nx-amz-date:" + amzdate + "\n" + "\n" + signed_headers + "\n" + to_hex(sha256_bytes(body))
+    scope := date8 + "/" + region + "/s3/aws4_request"
+    sts := "AWS4-HMAC-SHA256\n" + amzdate + "\n" + scope + "\n" + to_hex(sha256_bytes(bytes(canonical)))
+    k_date := hmac_sha256_bytes(bytes("AWS4" + secret), bytes(date8))
+    k_region := hmac_sha256_bytes(k_date, bytes(region))
+    k_service := hmac_sha256_bytes(k_region, bytes("s3"))
+    k_signing := hmac_sha256_bytes(k_service, bytes("aws4_request"))
+    sig := to_hex(hmac_sha256_bytes(k_signing, bytes(sts)))
+    auth = "AWS4-HMAC-SHA256 Credential=" + access_key + "/" + date8 + "/" + region + "/s3/aws4_request, SignedHeaders=" + signed_headers + ", Signature=" + sig
+}
+
+func main() {
+    // ---- store.src: pure helpers ----
+    assert_eq_str(bucket_dir("/data", "mb"), "/data/mb", "bucket_dir joins path")
+    assert_eq_str(blob_shard_path("/data/mb", "abcdef0123"), "/data/mb/objects/ab/cd/abcdef0123", "blob_shard_path shards by sha prefix")
+    assert_eq_str(mask_token("short"), "…", "mask_token: short token fully masked")
+    assert_eq_str(mask_token("re_fake000_NotARealKeyABCDEFGHijkl"), "re_…ijkl", "mask_token: long token shows first3/last4")
+
+    d := mktmp()
+    mkdir_p(d + "/a/b/c")
+    assert(is_dir(d + "/a/b/c"), "mkdir_p creates nested dirs in one call")
+
+    // ---- store.src: bucket lifecycle ----
+    data := mktmp()
+    tok, ok := bucket_create(data, "mb1")
+    assert(ok == 1, "bucket_create succeeds for a new bucket")
+    assert(len(tok) > 0, "bucket_create returns a nonempty token")
+
+    tok2, ok2 := resolve_bucket_token(data, "mb1")
+    assert(ok2 == 1, "resolve_bucket_token finds the bucket")
+    assert_eq_str(tok2, tok, "resolve_bucket_token returns the token bucket_create minted")
+
+    _, okdup := bucket_create(data, "mb1")
+    assert(okdup == 0, "bucket_create refuses to recreate an existing bucket")
+
+    _, oknone := resolve_bucket_token(data, "nosuchbucket")
+    assert(oknone == 0, "resolve_bucket_token: unknown bucket -> ok=0")
+
+    blist := bucket_list_body(data)
+    assert(contains(blist, "mb1"), "bucket_list_body lists the bucket")
+    assert(has_prefix(blist, "\"buckets\":["), "bucket_list_body wraps buckets in a JSON array field")
+
+    // ---- store.src: object lifecycle, dedup, refcounted delete ----
+    raw := bytes("hello unit test bytes")
+    sha, size, pok := obj_put(data, "mb1", "k1", raw, "text/plain")
+    assert(pok == 1, "obj_put succeeds into an existing bucket")
+    assert_eq_int(size, len(raw), "obj_put reports the correct size")
+    assert_eq_str(sha, to_hex(sha256_bytes(raw)), "obj_put's sha matches sha256 of the bytes")
+
+    got, ct, gsha, created_at, gok := obj_get(data, "mb1", "k1")
+    assert(gok == 1, "obj_get finds the stored key")
+    assert_eq_str(bytes_str(got), bytes_str(raw), "obj_get returns the exact bytes")
+    assert_eq_str(ct, "text/plain", "obj_get returns the stored content-type")
+    assert_eq_str(gsha, sha, "obj_get returns the same sha obj_put computed")
+    assert(created_at > 0, "obj_get returns a nonzero created_at")
+
+    ssize, sct, sok := obj_stat(data, "mb1", "k1")
+    assert(sok == 1, "obj_stat finds the key")
+    assert_eq_int(ssize, size, "obj_stat's size matches obj_put's")
+    assert_eq_str(sct, "text/plain", "obj_stat's content-type matches")
+
+    listbody, lok := obj_list_body(data, "mb1", "")
+    assert(lok == 1, "obj_list_body succeeds for an existing bucket")
+    assert(contains(listbody, "k1"), "obj_list_body lists the stored key")
+
+    _, _, _, _, nfok := obj_get(data, "mb1", "nosuchkey")
+    assert(nfok == 0, "obj_get: missing key -> ok=0")
+    _, _, nsok := obj_stat(data, "nosuchbucket2", "k1")
+    assert(nsok == 0, "obj_stat: missing bucket -> ok=0")
+
+    _, _, dpok := obj_put(data, "mb1", "k2", raw, "text/plain")
+    assert(dpok == 1, "obj_put: second key with identical bytes succeeds")
+    shard := blob_shard_path(bucket_dir(data, "mb1"), sha)
+    kind1, _, _ := stat(shard)
+    assert(kind1 == 1, "dedup: identical bytes under a second key share one blob file")
+
+    dok1 := obj_delete(data, "mb1", "k1")
+    assert(dok1 == 1, "obj_delete succeeds for an existing key")
+    kind2, _, _ := stat(shard)
+    assert(kind2 == 1, "refcount 2->1: blob survives delete while a second key still references it")
+
+    dok2 := obj_delete(data, "mb1", "k2")
+    assert(dok2 == 1, "obj_delete succeeds for the second key")
+    kind3, _, _ := stat(shard)
+    assert(kind3 == 0, "refcount 1->0: blob is removed once the last reference is deleted")
+
+    dnf := obj_delete(data, "mb1", "k1")
+    assert(dnf == 0, "obj_delete: already-deleted key -> ok=0")
+
+    // ---- store.src: blob_ref_dec directly (not just through obj_delete) ----
+    bdir_mb1 := bucket_dir(data, "mb1")
+    idxdb_test := sqlite_open(bdir_mb1 + "/index.db")
+    sqlite_exec(idxdb_test, "INSERT OR REPLACE INTO blobs(sha, refcount) VALUES(?, 2)", []string{"deadbeefsha"})
+    blob_ref_dec(bdir_mb1, idxdb_test, "deadbeefsha")
+    rows_bd := sqlite_query(idxdb_test, "SELECT refcount FROM blobs WHERE sha=?", []string{"deadbeefsha"})
+    assert(contains(rows_bd, "\"refcount\":1"), "blob_ref_dec: decrements refcount 2->1")
+    blob_ref_dec(bdir_mb1, idxdb_test, "deadbeefsha")
+    rows_bd2 := sqlite_query(idxdb_test, "SELECT refcount FROM blobs WHERE sha=?", []string{"deadbeefsha"})
+    assert_eq_str(rows_bd2, "[]", "blob_ref_dec: row removed once refcount reaches zero")
+    sqlite_close(idxdb_test)
+
+    // ---- sigv4.src ----
+    ak, ad, ar, ash, asig, apok := sigv4_parse_auth("AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef")
+    assert(apok == 1, "sigv4_parse_auth parses a well-formed header")
+    assert_eq_str(ak, "AKID", "sigv4_parse_auth extracts the access key")
+    assert_eq_str(ad, "20260101", "sigv4_parse_auth extracts the date")
+    assert_eq_str(ar, "us-east-1", "sigv4_parse_auth extracts the region")
+    assert_eq_str(ash, "host;x-amz-date", "sigv4_parse_auth extracts SignedHeaders")
+    assert_eq_str(asig, "deadbeef", "sigv4_parse_auth extracts the signature")
+
+    _, _, _, _, _, badok := sigv4_parse_auth("Bearer sometoken")
+    assert(badok == 0, "sigv4_parse_auth rejects a non-SigV4 Authorization header")
+    _, _, _, _, _, badok2 := sigv4_parse_auth("AWS4-HMAC-SHA256 Credential=onlytwoparts")
+    assert(badok2 == 0, "sigv4_parse_auth rejects a malformed Credential")
+
+    assert_eq_str(sigv4_canonical_query("/x?zzz=1&aaa=2&mmm=3"), "aaa=2&mmm=3&zzz=1", "sigv4_canonical_query sorts params lexicographically")
+    assert_eq_str(sigv4_canonical_query("/x"), "", "sigv4_canonical_query: no query string -> empty")
+
+    hreq := Request{method: "GET", path: "/x", headers: h2("host", "example.com", "x-amz-date", "20260101T000000Z"), body_bytes: bytes("")}
+    assert_eq_str(sigv4_canonical_headers(hreq, "host;x-amz-date"), "host:example.com\nx-amz-date:20260101T000000Z\n", "sigv4_canonical_headers formats name:value per line")
+
+    phreq1 := Request{headers: h1("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), body_bytes: bytes("whatever")}
+    assert_eq_str(sigv4_payload_hash(phreq1), "UNSIGNED-PAYLOAD", "sigv4_payload_hash trusts an explicit sentinel header")
+    phreq2 := Request{headers: make(map[string]string), body_bytes: bytes("hi")}
+    assert_eq_str(sigv4_payload_hash(phreq2), to_hex(sha256_bytes(bytes("hi"))), "sigv4_payload_hash computes sha256 when the header is absent")
+
+    date8 := "20260101"
+    region := "us-east-1"
+    amzdate := "20260101T000000Z"
+    secret := "testsecret123"
+    good_auth := test_sign("GET", "/mb1", "mb1", secret, region, amzdate, date8, bytes(""))
+    // No x-amz-content-sha256 header: sigv4_payload_hash falls back to
+    // hashing the real (empty) body, matching test_sign's own convention.
+    vreq := Request{method: "GET", path: "/mb1", headers: h3("host", "example.com", "x-amz-date", amzdate, "authorization", good_auth), body_bytes: bytes("")}
+    vak, vok := sigv4_verify(vreq, "/mb1", secret)
+    assert(vok == 1, "sigv4_verify accepts a correctly-signed request (independently re-derived signer)")
+    assert_eq_str(vak, "mb1", "sigv4_verify returns the Credential's access key")
+
+    bad_auth := "AWS4-HMAC-SHA256 Credential=mb1/" + date8 + "/" + region + "/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+    vreq2 := Request{method: "GET", path: "/mb1", headers: h3("host", "example.com", "x-amz-date", amzdate, "authorization", bad_auth), body_bytes: bytes("")}
+    _, vok2 := sigv4_verify(vreq2, "/mb1", secret)
+    assert(vok2 == 0, "sigv4_verify rejects a tampered signature")
+
+    _, vok3 := sigv4_verify(vreq, "/mb1", "wrongsecret")
+    assert(vok3 == 0, "sigv4_verify rejects the right signature checked against the wrong secret")
+
+    // ---- s3.src ----
+    assert_eq_str(xml_esc("<a>&\"b\"</a>"), "&lt;a&gt;&amp;\"b\"&lt;/a&gt;", "xml_esc escapes < > & (not quotes)")
+
+    e4 := s3_error("500 Internal Server Error", "InternalError", "test message", "res")
+    assert_eq_str(e4.status, "500 Internal Server Error", "s3_error builds an arbitrary status")
+    assert(contains(e4.body, "InternalError"), "s3_error includes the given code")
+
+    e1 := s3_no_such_bucket("mb")
+    assert_eq_str(e1.status, "404 Not Found", "s3_no_such_bucket: 404 status")
+    assert(contains(e1.body, "NoSuchBucket"), "s3_no_such_bucket: real S3 error code in body")
+    e2 := s3_no_such_key("k")
+    assert(contains(e2.body, "NoSuchKey"), "s3_no_such_key: real S3 error code in body")
+    e3 := s3_forbidden("bad sig")
+    assert_eq_str(e3.status, "403 Forbidden", "s3_forbidden: 403 status")
+    assert(contains(e3.body, "SignatureDoesNotMatch"), "s3_forbidden: real S3 error code in body")
+
+    sb1, sk1, shk1 := split_s3_bucket_key("/mybucket")
+    assert_eq_str(sb1, "mybucket", "split_s3_bucket_key: bucket only")
+    assert_eq_str(sk1, "", "split_s3_bucket_key: no key when path has no second segment")
+    assert(shk1 == 0, "split_s3_bucket_key: has_key=0 for bucket-only path")
+    sb2, sk2, shk2 := split_s3_bucket_key("/mybucket/a/b/c.txt?list-type=2")
+    assert_eq_str(sb2, "mybucket", "split_s3_bucket_key: bucket with a nested key")
+    assert_eq_str(sk2, "a/b/c.txt", "split_s3_bucket_key: key can contain slashes")
+    assert(shk2 == 1, "split_s3_bucket_key: has_key=1 when a key segment is present")
+    sb3, _, shk3 := split_s3_bucket_key("/")
+    assert_eq_str(sb3, "", "split_s3_bucket_key: bare slash -> no bucket")
+    assert(shk3 == 0, "split_s3_bucket_key: bare slash -> has_key=0")
+
+    _, _, _ := obj_put(data, "mb1", "listme.txt", bytes("xyz"), "text/plain")
+    xml, xok := s3_list_xml(data, "mb1", "")
+    assert(xok == 1, "s3_list_xml succeeds for an existing bucket")
+    assert(contains(xml, "<Key>listme.txt</Key>"), "s3_list_xml includes the object's key")
+    assert(contains(xml, "ListBucketResult"), "s3_list_xml wraps contents in ListBucketResult")
+    _, xok2 := s3_list_xml(data, "nosuchbucket4", "")
+    assert(xok2 == 0, "s3_list_xml: missing bucket -> ok=0")
+
+    tok3, bok3 := bucket_create(data, "s3fn")
+    assert(bok3 == 1, "setup: bucket_create for s3_handle tests")
+    body1 := bytes("s3handle content")
+    auth1 := test_sign("PUT", "/s3fn/hello.txt", "s3fn", tok3, region, amzdate, date8, body1)
+    putreq := Request{method: "PUT", path: "/s3fn/hello.txt", headers: h3("host", "example.com", "x-amz-date", amzdate, "authorization", auth1), body_bytes: body1}
+    putres := s3_handle(data, putreq)
+    assert_eq_str(putres.status, "200 OK", "s3_handle PUT: 200 on success")
+
+    auth2 := test_sign("GET", "/s3fn/hello.txt", "s3fn", tok3, region, amzdate, date8, bytes(""))
+    getreq := Request{method: "GET", path: "/s3fn/hello.txt", headers: h3("host", "example.com", "x-amz-date", amzdate, "authorization", auth2), body_bytes: bytes("")}
+    getres := s3_handle(data, getreq)
+    assert_eq_str(bytes_str(getres.bin), "s3handle content", "s3_handle GET: returns the uploaded bytes")
+
+    forbreq := Request{method: "GET", path: "/s3fn/hello.txt", headers: h3("host", "example.com", "x-amz-date", amzdate, "authorization", bad_auth), body_bytes: bytes("")}
+    forbres := s3_handle(data, forbreq)
+    assert_eq_str(forbres.status, "403 Forbidden", "s3_handle: wrong signature -> 403")
+
+    noauthreq := Request{method: "GET", path: "/s3fn/hello.txt", headers: make(map[string]string), body_bytes: bytes("")}
+    noauthres := s3_handle(data, noauthreq)
+    assert_eq_str(noauthres.status, "403 Forbidden", "s3_handle: missing Authorization -> 403")
+
+    nobucketreq := Request{method: "GET", path: "/nosuchbucket5/x", headers: make(map[string]string), body_bytes: bytes("")}
+    nobucketres := s3_handle(data, nobucketreq)
+    assert_eq_str(nobucketres.status, "404 Not Found", "s3_handle: unknown bucket -> 404")
+
+    auth4 := test_sign("DELETE", "/s3fn/hello.txt", "s3fn", tok3, region, amzdate, date8, bytes(""))
+    delreq := Request{method: "DELETE", path: "/s3fn/hello.txt", headers: h3("host", "example.com", "x-amz-date", amzdate, "authorization", auth4), body_bytes: bytes("")}
+    delres := s3_handle(data, delreq)
+    assert_eq_str(delres.status, "204 No Content", "s3_handle DELETE: 204 on success")
+
+    // ---- server.src ----
+    assert_eq_str(wrap("\"a\":1"), "{\"version\":\"1\",\"ok\":true,\"a\":1}", "wrap builds the versioned envelope")
+
+    unauth := unauthorized()
+    assert_eq_str(unauth.status, "401 Unauthorized", "unauthorized() returns 401")
+
+    creq := Request{headers: h1("authorization", "Bearer sekrit")}
+    assert(check_bearer(creq, "sekrit") == 1, "check_bearer: matching token -> 1")
+    assert(check_bearer(creq, "other") == 0, "check_bearer: wrong token -> 0")
+    creq2 := Request{headers: make(map[string]string)}
+    assert(check_bearer(creq2, "sekrit") == 0, "check_bearer: missing header -> 0")
+
+    assert_eq_str(path_no_query("/a/b?x=1"), "/a/b", "path_no_query strips the query string")
+    assert_eq_str(path_no_query("/a/b"), "/a/b", "path_no_query: no query string -> unchanged")
+
+    pb, pk, phk := split_bucket_key("/b/mb1/o/some/key.txt")
+    assert_eq_str(pb, "mb1", "split_bucket_key: extracts bucket")
+    assert_eq_str(pk, "some/key.txt", "split_bucket_key: key can contain slashes")
+    assert(phk == 1, "split_bucket_key: has_key=1")
+    pb2, _, phk2 := split_bucket_key("/b/mb1")
+    assert_eq_str(pb2, "mb1", "split_bucket_key: bucket-only path")
+    assert(phk2 == 0, "split_bucket_key: has_key=0 for bucket-only path")
+
+    hres1 := handle(data, Request{path: "/healthz", method: "GET", headers: make(map[string]string), body_bytes: bytes("")})
+    assert(contains(hres1.body, "\"ok\":true"), "handle: /healthz returns ok")
+
+    tok4, _ := bucket_create(data, "handlefn")
+    putreq2 := Request{method: "PUT", path: "/b/handlefn/o/x.txt", headers: h1("authorization", "Bearer " + tok4), body_bytes: bytes("phase1 body")}
+    putres2 := handle(data, putreq2)
+    assert_eq_str(putres2.status, "201 Created", "handle: Phase 1 PUT -> 201")
+
+    getreq2 := Request{method: "GET", path: "/b/handlefn/o/x.txt", headers: h1("authorization", "Bearer " + tok4), body_bytes: bytes("")}
+    getres2 := handle(data, getreq2)
+    assert_eq_str(bytes_str(getres2.bin), "phase1 body", "handle: Phase 1 GET returns the uploaded bytes")
+
+    noauthreq2 := Request{method: "GET", path: "/b/handlefn/o/x.txt", headers: make(map[string]string), body_bytes: bytes("")}
+    noauthres2 := handle(data, noauthreq2)
+    assert_eq_str(noauthres2.status, "401 Unauthorized", "handle: Phase 1 missing token -> 401")
+
+    s3viahandle := handle(data, Request{method: "GET", path: "/nosuchbucket6", headers: make(map[string]string), body_bytes: bytes("")})
+    assert_eq_str(s3viahandle.status, "404 Not Found", "handle: a path not under /b/ falls through to the S3 facade")
+
+    test_summary()
+}

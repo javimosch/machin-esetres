@@ -23,6 +23,8 @@ out=$($BIN help-json); grep -q '"tool":"machin-esetres"' <<<"$out"
 out=$($BIN bucket create mymailbox); grep -q '"ok":true' <<<"$out"
 TOKEN=$(echo "$out" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 test -n "$TOKEN"
+out=$($BIN bucket list); grep -q '"name":"mymailbox"' <<<"$out"
+! grep -q "$TOKEN" <<<"$out"   # the full token must never appear in `bucket list`
 
 # ---- CLI: put / ls / get, and content survives the round-trip ----
 out=$($BIN put mymailbox "att/1/invoice.pdf" "$FILE" --content-type application/pdf)
@@ -107,6 +109,19 @@ if command -v aws >/dev/null 2>&1; then
     rm -f /tmp/machin-esetres-smoke-awserr
 
     aws --endpoint-url "$ENDPOINT" s3 rm s3://s3test/hello.txt >/dev/null
+
+    set +e
+    aws --endpoint-url "$ENDPOINT" s3api head-object --bucket s3test --key hello.txt >/dev/null 2>/tmp/machin-esetres-smoke-awserr2
+    set -e
+    grep -q "Not Found\|404" /tmp/machin-esetres-smoke-awserr2
+    rm -f /tmp/machin-esetres-smoke-awserr2
+
+    set +e
+    aws --endpoint-url "$ENDPOINT" s3 ls s3://nosuchbucket/ >/dev/null 2>/tmp/machin-esetres-smoke-awserr3
+    set -e
+    grep -q NoSuchBucket /tmp/machin-esetres-smoke-awserr3
+    rm -f /tmp/machin-esetres-smoke-awserr3
+
     unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
     echo "OK machin-esetres smoke (Phase 1 + Phase 2 / real aws-cli)"
 else

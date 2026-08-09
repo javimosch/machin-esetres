@@ -191,3 +191,48 @@ implementation doesn't pool SQLite connections, opening a fresh
 `sqlite_open` per request instead, which is correct but unmeasured under
 concurrent load), and behavior once rbm21's disk actually fills with real
 attachment data.
+
+## Coverage gate (2026-08-09) — required before further implementation
+
+Policy: 70% unit coverage + 50% functional/smoke coverage before any new
+implementation work (e.g. the poche-resend-webmail wiring scoped above).
+Applies to machin-esetres only, not poche-resend-webmail (which already has
+its own Go test suite + CI from earlier work).
+
+**No coverage-instrumentation tool exists for machin** — confirmed by
+checking, not assumed: `machin test` (added per issue #236, "Stage A") runs
+`framework/test.src`'s assert-based tests and reports a pass/fail tally, and
+the changelog says outright *"Stage B (real per-line `.src` coverage) is
+deferred, per the issue's own staged plan."* So both numbers below are a
+**manual function-level tally** — `<functions with ≥1 direct test> /
+<total functions>` — not a tool-computed percentage. Stated plainly so it's
+never mistaken for `go test -cover`-style instrumentation.
+
+- **Unit** (`./test.sh` → `machin test` over `src/test.src`, 98 assertions,
+  zero live process — `Request`/`Response` are plain structs, constructed
+  directly): **32/44 functions = 72.7%**, clears the 70% bar. `serve_app`
+  and `main.src`'s 11 CLI-glue functions (`emit`/`die`/`cmd_*`/`main`) are
+  the only ones not directly unit-tested — they read real argv or open a
+  real listening socket, so a "unit" test of them would just be smoke.sh
+  with extra steps.
+- **Functional/smoke** (`./smoke.sh` → real CLI, real HTTP, real `aws-cli`):
+  traced by hand across the actual run — every one of the 44 functions
+  executes somewhere in it (the CLI-glue functions unit tests skip are
+  exactly what smoke.sh drives directly). **44/44 = 100%**, clears the 50%
+  bar with margin.
+- **Verified real, not vacuous**: broke `mask_token` (`m = "BROKEN"`), ran
+  `./test.sh`, confirmed the exact expected failure
+  (`FAIL: mask_token: ... -- got BROKEN, want re_…S574`), then reverted —
+  `git diff` showed a clean revert. The suite also caught one genuine bug in
+  itself before this: an early draft's `sigv4_verify` test set an
+  `x-amz-content-sha256: UNSIGNED-PAYLOAD` header while its independent
+  `test_sign` helper always hashed the real body — a real mismatch between
+  the fixture and the signer, not a bug in `sigv4.src`, caught by the test
+  failing exactly where the mismatch was.
+- **`sigv4_verify`'s unit test signs from scratch**, independently
+  re-deriving the AWS SigV4 canonical-request/signing-key steps in
+  `test.src`'s own `test_sign` rather than calling `sigv4.src`'s
+  `sigv4_canonical_query`/`sigv4_canonical_headers` — so a bug shared
+  between the signer and the verifier wouldn't silently cancel out. The
+  stronger ground-truth check remains smoke.sh's run against a genuine
+  `aws-cli`, which neither file's code can influence.
