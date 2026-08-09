@@ -23,6 +23,9 @@
 //     the bucket with `machin-esetres bucket create` first.
 //   - ListObjectsV2 only (no ListObjects v1, no pagination/continuation
 //     token — see store.src's obj_list_body limits).
+//   - QuotaExceeded (507) is a synthetic error code — AWS has no real S3
+//     equivalent for a self-hosted per-bucket quota (MinIO's own
+//     XMinioStorageFull extension is the closest real-world precedent).
 
 func xml_esc(s) (o) {
     o = replace(s, "&", "&amp;")
@@ -39,6 +42,10 @@ func s3_error(status, code, message, resource) (r) {
 func s3_forbidden(msg) (r) { r = s3_error("403 Forbidden", "SignatureDoesNotMatch", msg, "") }
 func s3_no_such_bucket(name) (r) { r = s3_error("404 Not Found", "NoSuchBucket", "The specified bucket does not exist", name) }
 func s3_no_such_key(name) (r) { r = s3_error("404 Not Found", "NoSuchKey", "The specified key does not exist", name) }
+// s3_quota_exceeded uses a synthetic code — AWS has no real equivalent for a
+// self-hosted per-bucket quota; MinIO's own extension (XMinioStorageFull) is
+// the closest real-world precedent for "invent one, disclose it."
+func s3_quota_exceeded(msg) (r) { r = s3_error("507 Insufficient Storage", "QuotaExceeded", msg, "") }
 
 // split_s3_bucket_key parses path-style S3 routing: "/<bucket>" or
 // "/<bucket>/<key...>" (path_no_query is defined in server.src — one
@@ -116,8 +123,9 @@ func s3_handle(data, req) (res) {
     if req.method == "PUT" {
         ct := header(req, "content-type")
         if ct == "" { ct = "application/octet-stream" }
-        sha, _, ok := obj_put(data, bucket, key, req.body_bytes, ct)
+        sha, _, ok, err_msg := obj_put(data, bucket, key, req.body_bytes, ct)
         if ok == 0 { res = s3_no_such_bucket(bucket)  return }
+        if ok == 2 { res = s3_quota_exceeded(err_msg)  return }
         res = with_header(response("200 OK", ct, ""), "ETag", "\"" + sha + "\"")
         return
     }

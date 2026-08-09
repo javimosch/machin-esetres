@@ -31,11 +31,12 @@ directory.
 **Phase 1 and Phase 2 are both built and passing `./smoke.sh`** — including a
 Phase 2 run against a genuine `aws-cli` (real independent SigV4 signing, not
 our own signer testing our own verifier). Deployed and running on rbm21 (see
-"Where it runs" below). **Coverage gate met**: 72.7% unit (`./test.sh`,
-32/44 functions, verified real by an intentional break-and-confirm-failure
-check) + 100% functional/smoke (`./smoke.sh`, 44/44 functions traced) — see
-AGENTS.md's "Coverage gate" section for the full methodology, since machin
-has no coverage-instrumentation tool to compute this automatically. Not yet
+"Where it runs" below). **Coverage gate met**: 74.1% unit (`./test.sh`,
+40/54 functions, verified real by an intentional break-and-confirm-failure
+check) + functional/smoke (`./smoke.sh`) well over the 50% bar — see
+AGENTS.md's "Coverage gate" section for the full methodology and the one
+disclosed gap, since machin has no coverage-instrumentation tool to compute
+this automatically. Not yet
 wired into poche-resend-webmail itself — see [AGENTS.md](AGENTS.md) for the
 open questions and next steps.
 
@@ -94,7 +95,7 @@ decrements the count and only unlinks the blob file at zero. Multiple keys
 ## API (Phase 1 — as built)
 
 ```
-PUT    /b/<bucket>/o/<key>        upload — body is the raw bytes
+PUT    /b/<bucket>/o/<key>        upload — body is the raw bytes (507 if over the bucket quota or disk floor)
 GET    /b/<bucket>/o/<key>        download
 HEAD   /b/<bucket>/o/<key>        JSON metadata (not a bodyless response — see AGENTS.md)
 DELETE /b/<bucket>/o/<key>        delete (refcount-aware)
@@ -116,8 +117,9 @@ stdout, errors on stderr in the same envelope, semantic exit-code bands,
 `help-json` for self-description.
 
 ```bash
-machin-esetres -d <data-dir> bucket create <name>   # prints the token — shown once, here only
-machin-esetres -d <data-dir> bucket list
+machin-esetres -d <data-dir> bucket create <name> [--max-bytes N]   # prints the token — shown once, here only
+machin-esetres -d <data-dir> bucket list                            # includes used_bytes/max_bytes per bucket
+machin-esetres -d <data-dir> bucket set-quota <name> <bytes>        # change an existing bucket's cap (0 = unlimited)
 machin-esetres -d <data-dir> put <bucket> <key> <file> [--content-type <ct>]
 machin-esetres -d <data-dir> get <bucket> <key> --to <file>
 machin-esetres -d <data-dir> rm <bucket> <key>
@@ -128,6 +130,29 @@ machin-esetres help-json
 
 `put`/`get` take real file paths only in Phase 1 (no `-` for stdin — see
 AGENTS.md's non-goals).
+
+### Storage caps ("esetres storage cannot grow indefinitely")
+
+Two independent limits, both enforced in `obj_put` — the one place every
+write path (Phase 1, Phase 2, CLI) funnels through:
+
+- **Per-bucket quota** — `bucket create --max-bytes N` (0/omitted =
+  unlimited), changeable later with `bucket set-quota <name> <bytes>`.
+  Counts actual blob bytes, not per-key sizes — two keys sharing a deduped
+  blob are counted once, so re-uploading identical content never costs
+  quota twice, and a write that's a pure dedup hit always succeeds even at
+  quota, since it consumes zero new bytes.
+- **Global disk floor** — `ESETRES_MIN_FREE_BYTES` (default 512MB), the
+  same idea as poche-resend-webmail's own `BLOB_MIN_FREE_BYTES`: refuses a
+  new blob write if it would push free disk below the floor, regardless of
+  any bucket's own quota. Checked via `df` (machin has no disk-space
+  builtin) — best-effort: if `df` fails for any reason, the check is
+  skipped rather than blocking writes on a broken check.
+
+A refused write returns `ok=2` from `obj_put` (distinct from `ok=0`, no
+such bucket) — CLI exits `95`, the Phase 1 HTTP API returns `507
+Insufficient Storage`, and the S3 facade returns a synthetic (AWS has no
+real equivalent) `QuotaExceeded` error, same status code.
 
 ### Try it
 

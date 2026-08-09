@@ -15,8 +15,10 @@
 type ShaRow struct { sha string }
 type ObjMeta struct { sha string  content_type string  created_at int }
 type BlobRow struct { sha string  refcount int }
-type BucketRow struct { name string  token string  created_at int }
+type BucketRow struct { name string  token string  created_at int  max_bytes int }
 type TokenRow struct { token string }
+type QuotaRow struct { max_bytes int }
+type SumRow struct { total int }
 
 func bucket_dir(data, name) (p) { p = data + "/" + name }
 
@@ -44,6 +46,36 @@ func mask_token(s) (m) {
     if len(s) > 8 { m = substr(s, 0, 3) + "…" + substr(s, len(s) - 4, len(s)) }
 }
 
+// shq single-quotes a value for safe use in a shell command line.
+func shq(s) (q) {
+    q = "'" + replace(s, "'", "'\\''") + "'"
+}
+
+// esetres_min_free_bytes is the global floor below which storing is refused
+// — same idea and env-var-naming convention as poche-resend-webmail's own
+// BLOB_MIN_FREE_BYTES, so a mailbox filling one storage backend can't take
+// the whole host down with it either way.
+func esetres_min_free_bytes() (n) {
+    n = 512 * 1024 * 1024
+    v := env("ESETRES_MIN_FREE_BYTES")
+    if v != "" { n = parse_int(v) }
+}
+
+// disk_free_bytes shells out to `df` — machin has no statfs/disk-space
+// builtin. ok=0 on any failure (missing df, unreadable path); callers treat
+// that as "couldn't check" and don't block the write on it, matching
+// blobstore.go's own "best-effort" framing for the same check.
+func disk_free_bytes(path) (n, ok) {
+    n = 0
+    ok = 0
+    code, out, err := exec("df -B1 --output=avail " + shq(path) + " | tail -1")
+    if code != 0 || err != "" { return }
+    v := trim(out)
+    if v == "" { return }
+    n = parse_int(v)
+    ok = 1
+}
+
 // resolve_bucket_token looks up a bucket's bearer token — the HTTP layer's auth check.
 func resolve_bucket_token(data, name) (token, ok) {
     token = ""
@@ -60,7 +92,10 @@ func resolve_bucket_token(data, name) (token, ok) {
 // registers it. CLI-only in Phase 1 (no HTTP route creates buckets), so it is
 // allowed to be the one "core" function that's fine to wrap with die() at the
 // call site rather than threading an ok flag through — nothing else calls it.
-func bucket_create(data, name) (token, ok) {
+// bucket_create makes a bucket dir + its index tables, mints a token, and
+// registers it. max_bytes is a per-bucket cap on total blob bytes (0 =
+// unlimited — see the "cannot grow indefinitely" rationale on obj_put).
+func bucket_create(data, name, max_bytes) (token, ok) {
     ok = 0
     token = ""
     bdir := bucket_dir(data, name)
@@ -68,29 +103,65 @@ func bucket_create(data, name) (token, ok) {
     mkdir_p(bdir + "/objects")
     idxdb := sqlite_open(bdir + "/index.db")
     sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS objects(key TEXT PRIMARY KEY, sha TEXT, size INTEGER, content_type TEXT, created_at INTEGER)")
-    sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS blobs(sha TEXT PRIMARY KEY, refcount INTEGER)")
+    sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS blobs(sha TEXT PRIMARY KEY, refcount INTEGER, size INTEGER)")
     sqlite_close(idxdb)
     token = to_hex(rand_bytes(16))
     reg := sqlite_open(data + "/buckets.db")
-    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER)")
-    sqlite_exec(reg, "INSERT INTO buckets(name, token, created_at) VALUES(?, ?, ?)", []string{name, token, str(now())})
+    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER, max_bytes INTEGER)")
+    sqlite_exec(reg, "INSERT INTO buckets(name, token, created_at, max_bytes) VALUES(?, ?, ?, ?)", []string{name, token, str(now()), str(max_bytes)})
     sqlite_close(reg)
     ok = 1
+}
+
+// bucket_set_quota changes an existing bucket's cap (0 = unlimited).
+func bucket_set_quota(data, name, max_bytes) (ok) {
+    ok = 0
+    if !is_dir(bucket_dir(data, name)) { return }
+    reg := sqlite_open(data + "/buckets.db")
+    sqlite_exec(reg, "UPDATE buckets SET max_bytes=? WHERE name=?", []string{str(max_bytes), name})
+    sqlite_close(reg)
+    ok = 1
+}
+
+func bucket_quota(data, name) (max_bytes, ok) {
+    max_bytes = 0
+    ok = 0
+    reg := sqlite_open(data + "/buckets.db")
+    rows := sqlite_query(reg, "SELECT max_bytes FROM buckets WHERE name=?", []string{name})
+    sqlite_close(reg)
+    list := parse(rows, []QuotaRow{})
+    if len(list) > 0 { max_bytes = list[0].max_bytes  ok = 1 }
+}
+
+// bucket_bytes_used sums actual blob bytes (not per-key sizes — two keys
+// sharing a deduped blob must not double-count it, or the quota would
+// punish dedup instead of rewarding it).
+func bucket_bytes_used(data, name) (used) {
+    used = 0
+    bdir := bucket_dir(data, name)
+    if !is_dir(bdir) { return }
+    idxdb := sqlite_open(bdir + "/index.db")
+    rows := sqlite_query(idxdb, "SELECT COALESCE(SUM(size),0) AS total FROM blobs")
+    sqlite_close(idxdb)
+    list := parse(rows, []SumRow{})
+    if len(list) > 0 { used = list[0].total }
 }
 
 func bucket_list_body(data) (body) {
     body = "\"buckets\":[]"
     if !is_dir(data) { return }
     reg := sqlite_open(data + "/buckets.db")
-    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER)")
-    rows := sqlite_query(reg, "SELECT name, token, created_at FROM buckets ORDER BY name")
+    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER, max_bytes INTEGER)")
+    rows := sqlite_query(reg, "SELECT name, token, created_at, max_bytes FROM buckets ORDER BY name")
     sqlite_close(reg)
     list := parse(rows, []BucketRow{})
     s := "\"buckets\":["
     i := 0
     for _, b := range list {
         if i > 0 { s = s + "," }
-        s = s + "{\"name\":\"" + b.name + "\",\"token\":\"" + mask_token(b.token) + "\",\"created_at\":" + str(b.created_at) + "}"
+        used := bucket_bytes_used(data, b.name)
+        s = s + "{\"name\":\"" + b.name + "\",\"token\":\"" + mask_token(b.token) + "\",\"created_at\":" + str(b.created_at) +
+            ",\"used_bytes\":" + str(used) + ",\"max_bytes\":" + str(b.max_bytes) + "}"
         i = i + 1
     }
     s = s + "]"
@@ -113,14 +184,22 @@ func blob_ref_dec(bdir, idxdb, sha) {
 
 // obj_put stores raw under key in bucket, content-addressed by sha256. Two
 // keys with identical bytes share one blob on disk (refcounted); overwriting
-// a key re-points it and decrements the old blob's refcount. ok=0 only if the
-// bucket doesn't exist — never dies, so a bad request can't take the server down.
-func obj_put(data, bucket, key, raw, content_type) (sha, size, ok) {
+// a key re-points it and decrements the old blob's refcount. Never dies, so
+// a bad request can't take the server down.
+//
+// ok: 0 = no such bucket, 1 = success, 2 = refused (bucket quota or global
+// disk floor — see esetres_min_free_bytes/bucket_quota). Both caps are
+// checked ONLY when a genuinely new blob needs disk space — a dedup hit
+// (identical bytes already stored under another key in this bucket) costs
+// nothing, so it always succeeds regardless of either cap; punishing dedup
+// would reward re-uploading the same bytes under a fresh key instead.
+func obj_put(data, bucket, key, raw, content_type) (sha, size, ok, err_msg) {
     ok = 0
     sha = ""
     size = 0
+    err_msg = ""
     bdir := bucket_dir(data, bucket)
-    if !is_dir(bdir) { return }
+    if !is_dir(bdir) { err_msg = "no such bucket: " + bucket  return }
     idxdb := sqlite_open(bdir + "/index.db")
     sha = to_hex(sha256_bytes(raw))
     size = len(raw)
@@ -134,10 +213,30 @@ func obj_put(data, bucket, key, raw, content_type) (sha, size, ok) {
         exist_rows := sqlite_query(idxdb, "SELECT sha FROM blobs WHERE sha=?", []string{sha})
         exist_list := parse(exist_rows, []ShaRow{})
         if len(exist_list) == 0 {
+            quota, qok := bucket_quota(data, bucket)
+            if qok == 1 && quota > 0 {
+                used := bucket_bytes_used(data, bucket)
+                if used + size > quota {
+                    sqlite_close(idxdb)
+                    err_msg = "bucket quota exceeded: " + str(used) + " + " + str(size) + " > " + str(quota) + " bytes"
+                    ok = 2
+                    return
+                }
+            }
+            free, fok := disk_free_bytes(bdir)
+            if fok == 1 {
+                floor := esetres_min_free_bytes()
+                if free - size < floor {
+                    sqlite_close(idxdb)
+                    err_msg = "refusing to store: only " + str(free) + " bytes free on the storage volume (floor " + str(floor) + ")"
+                    ok = 2
+                    return
+                }
+            }
             shard := bdir + "/objects/" + substr(sha, 0, 2) + "/" + substr(sha, 2, 4)
             mkdir_p(shard)
             write_file_bytes(blob_shard_path(bdir, sha), raw)
-            sqlite_exec(idxdb, "INSERT INTO blobs(sha, refcount) VALUES(?, 1)", []string{sha})
+            sqlite_exec(idxdb, "INSERT INTO blobs(sha, refcount, size) VALUES(?, 1, ?)", []string{sha, str(size)})
         } else {
             sqlite_exec(idxdb, "UPDATE blobs SET refcount = refcount + 1 WHERE sha=?", []string{sha})
         }

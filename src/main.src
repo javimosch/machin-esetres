@@ -3,7 +3,7 @@
 // integration · 110-119 internal). `help-json` is the self-describing
 // catalog an agent reads first. Same contract as machin-vault.
 
-var esetres_version = "0.1.0"
+var esetres_version = "0.2.0"
 
 func emit(body) { println("{\"version\":\"1\",\"ok\":true," + body + "}") }
 func die(code, msg) { write(2, "{\"version\":\"1\",\"ok\":false,\"error\":" + json(msg) + "}\n")  exit(code) }
@@ -18,27 +18,36 @@ func print_help_json() {
         "\"summary\":\"self-hosted object store: buckets, sha256-deduped objects, bearer-token HTTP API\"," +
         "\"commands\":[" +
         "{\"name\":\"version\",\"args\":\"\",\"desc\":\"print the tool version\"}," +
-        "{\"name\":\"bucket create\",\"args\":\"<name>\",\"desc\":\"create a bucket, print its bearer token (shown once, in full, here only)\"}," +
-        "{\"name\":\"bucket list\",\"args\":\"\",\"desc\":\"list buckets with masked tokens\"}," +
+        "{\"name\":\"bucket create\",\"args\":\"<name> [--max-bytes N]\",\"desc\":\"create a bucket, print its bearer token (shown once, in full, here only); --max-bytes caps total blob bytes (0/omitted = unlimited)\"}," +
+        "{\"name\":\"bucket list\",\"args\":\"\",\"desc\":\"list buckets with masked tokens, used_bytes, max_bytes\"}," +
+        "{\"name\":\"bucket set-quota\",\"args\":\"<name> <bytes>\",\"desc\":\"change an existing bucket's cap (0 = unlimited)\"}," +
         "{\"name\":\"put\",\"args\":\"<bucket> <key> <file>\",\"desc\":\"upload a file; deduped by sha256\"}," +
         "{\"name\":\"get\",\"args\":\"<bucket> <key> --to <file>\",\"desc\":\"download an object to a file\"}," +
         "{\"name\":\"rm\",\"args\":\"<bucket> <key>\",\"desc\":\"delete an object (refcount-aware blob cleanup)\"}," +
         "{\"name\":\"ls\",\"args\":\"<bucket> [--prefix p]\",\"desc\":\"list objects, optionally filtered by key prefix\"}," +
         "{\"name\":\"serve\",\"args\":\"--port N\",\"desc\":\"run the HTTP API\"}" +
         "]," +
-        "\"flags\":[\"--data/-d <dir> (default data)\",\"--to <file>\",\"--content-type <ct>\",\"--prefix <p>\",\"--port/-p <n> (default 9000)\"]," +
+        "\"flags\":[\"--data/-d <dir> (default data)\",\"--to <file>\",\"--content-type <ct>\",\"--prefix <p>\",\"--port/-p <n> (default 9000)\",\"--max-bytes <n> (bucket create)\"]," +
         "\"http_api\":\"PUT/GET/HEAD/DELETE /b/<bucket>/o/<key> + GET /b/<bucket>?prefix=<p>, Authorization: Bearer <bucket token>\"," +
-        "\"exit_codes\":\"0 ok | 80-89 input | 90-99 resource(not found) | 100-109 integration | 110-119 internal\"}")
+        "\"storage_caps\":\"per-bucket via bucket create --max-bytes / bucket set-quota (0=unlimited); a global floor via ESETRES_MIN_FREE_BYTES (default 512MB) refuses new writes below it regardless of bucket quota\"," +
+        "\"exit_codes\":\"0 ok | 80-89 input | 90-99 resource(not found/quota) | 100-109 integration | 110-119 internal\"}")
 }
 
-func cmd_bucket_create(data, name) {
+func cmd_bucket_create(data, name, max_bytes) {
     if name == "" { die(80, "bucket create requires <name>") }
-    token, ok := bucket_create(data, name)
+    token, ok := bucket_create(data, name, max_bytes)
     if ok == 0 { die(90, "bucket already exists: " + name) }
-    emit("\"bucket\":\"" + name + "\",\"token\":\"" + token + "\",\"note\":\"store this token now — it will not be shown in full again\"")
+    emit("\"bucket\":\"" + name + "\",\"token\":\"" + token + "\",\"max_bytes\":" + str(max_bytes) + ",\"note\":\"store this token now — it will not be shown in full again\"")
 }
 
 func cmd_bucket_list(data) { emit(bucket_list_body(data)) }
+
+func cmd_bucket_set_quota(data, name, max_bytes) {
+    if name == "" { die(80, "bucket set-quota requires <name> <bytes>") }
+    ok := bucket_set_quota(data, name, max_bytes)
+    if ok == 0 { die(90, "no such bucket: " + name) }
+    emit("\"bucket\":\"" + name + "\",\"max_bytes\":" + str(max_bytes))
+}
 
 func cmd_version() { emit("\"tool\":\"machin-esetres\",\"version\":\"" + esetres_version + "\"") }
 
@@ -49,8 +58,9 @@ func cmd_put(data, bucket, key, file, ctype) {
     raw := read_file_bytes(file)
     ct := ctype
     if ct == "" { ct = "application/octet-stream" }
-    sha, size, ok := obj_put(data, bucket, key, raw, ct)
+    sha, size, ok, err_msg := obj_put(data, bucket, key, raw, ct)
     if ok == 0 { die(90, "no such bucket: " + bucket) }
+    if ok == 2 { die(95, err_msg) }
     emit("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"sha256\":\"" + sha + "\",\"size\":" + str(size))
 }
 
@@ -84,6 +94,7 @@ func main() {
     fs = flag_str(fs, "content-type", "", "", "content type (put)")
     fs = flag_str(fs, "prefix", "", "", "key prefix filter (ls)")
     fs = flag_int(fs, "port", "p", "9000", "serve port")
+    fs = flag_int(fs, "max-bytes", "", "0", "per-bucket quota in bytes, 0 = unlimited (bucket create)")
     fs = parse_flags(fs, args())
     rest := flag_args(fs)
     cmd := arg_at(rest, 0)
@@ -96,8 +107,9 @@ func main() {
 
     if cmd == "bucket" {
         sub := arg_at(rest, 1)
-        if sub == "create" { cmd_bucket_create(data, arg_at(rest, 2))  return }
+        if sub == "create" { cmd_bucket_create(data, arg_at(rest, 2), flag_int_val(fs, "max-bytes"))  return }
         if sub == "list" { cmd_bucket_list(data)  return }
+        if sub == "set-quota" { cmd_bucket_set_quota(data, arg_at(rest, 2), parse_int(arg_at(rest, 3)))  return }
         die(80, "unknown bucket subcommand: " + sub)
         return
     }

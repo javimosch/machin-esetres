@@ -74,7 +74,7 @@ func main() {
 
     // ---- store.src: bucket lifecycle ----
     data := mktmp()
-    tok, ok := bucket_create(data, "mb1")
+    tok, ok := bucket_create(data, "mb1", 0)
     assert(ok == 1, "bucket_create succeeds for a new bucket")
     assert(len(tok) > 0, "bucket_create returns a nonempty token")
 
@@ -82,8 +82,19 @@ func main() {
     assert(ok2 == 1, "resolve_bucket_token finds the bucket")
     assert_eq_str(tok2, tok, "resolve_bucket_token returns the token bucket_create minted")
 
-    _, okdup := bucket_create(data, "mb1")
+    _, okdup := bucket_create(data, "mb1", 0)
     assert(okdup == 0, "bucket_create refuses to recreate an existing bucket")
+
+    q, qok := bucket_quota(data, "mb1")
+    assert(qok == 1, "bucket_quota finds the bucket")
+    assert_eq_int(q, 0, "bucket_quota: 0 (unlimited) as created")
+    su := bucket_set_quota(data, "mb1", 12345)
+    assert(su == 1, "bucket_set_quota succeeds for an existing bucket")
+    q2, _ := bucket_quota(data, "mb1")
+    assert_eq_int(q2, 12345, "bucket_quota reflects the updated value")
+    bucket_set_quota(data, "mb1", 0)   // back to unlimited for the rest of this test
+    su2 := bucket_set_quota(data, "nosuchbucket3", 1)
+    assert(su2 == 0, "bucket_set_quota: unknown bucket -> ok=0")
 
     _, oknone := resolve_bucket_token(data, "nosuchbucket")
     assert(oknone == 0, "resolve_bucket_token: unknown bucket -> ok=0")
@@ -94,7 +105,7 @@ func main() {
 
     // ---- store.src: object lifecycle, dedup, refcounted delete ----
     raw := bytes("hello unit test bytes")
-    sha, size, pok := obj_put(data, "mb1", "k1", raw, "text/plain")
+    sha, size, pok, _ := obj_put(data, "mb1", "k1", raw, "text/plain")
     assert(pok == 1, "obj_put succeeds into an existing bucket")
     assert_eq_int(size, len(raw), "obj_put reports the correct size")
     assert_eq_str(sha, to_hex(sha256_bytes(raw)), "obj_put's sha matches sha256 of the bytes")
@@ -120,11 +131,14 @@ func main() {
     _, _, nsok := obj_stat(data, "nosuchbucket2", "k1")
     assert(nsok == 0, "obj_stat: missing bucket -> ok=0")
 
-    _, _, dpok := obj_put(data, "mb1", "k2", raw, "text/plain")
+    _, _, dpok, _ := obj_put(data, "mb1", "k2", raw, "text/plain")
     assert(dpok == 1, "obj_put: second key with identical bytes succeeds")
     shard := blob_shard_path(bucket_dir(data, "mb1"), sha)
     kind1, _, _ := stat(shard)
     assert(kind1 == 1, "dedup: identical bytes under a second key share one blob file")
+
+    used_after_dedup := bucket_bytes_used(data, "mb1")
+    assert_eq_int(used_after_dedup, size, "bucket_bytes_used counts the shared blob ONCE, not once per key")
 
     dok1 := obj_delete(data, "mb1", "k1")
     assert(dok1 == 1, "obj_delete succeeds for an existing key")
@@ -150,6 +164,45 @@ func main() {
     rows_bd2 := sqlite_query(idxdb_test, "SELECT refcount FROM blobs WHERE sha=?", []string{"deadbeefsha"})
     assert_eq_str(rows_bd2, "[]", "blob_ref_dec: row removed once refcount reaches zero")
     sqlite_close(idxdb_test)
+
+    // ---- store.src: per-bucket quota enforcement ----
+    quota_bucket_size := 19   // "quota test bytes!!!" is exactly 19 bytes
+    _, qbok := bucket_create(data, "quotafn", quota_bucket_size)
+    assert(qbok == 1, "setup: bucket_create with a small quota")
+    qraw := bytes("quota test bytes!!!")
+    assert_eq_int(len(qraw), quota_bucket_size, "setup: fixture is exactly the quota size")
+
+    _, qsize1, qok1, _ := obj_put(data, "quotafn", "first.bin", qraw, "application/octet-stream")
+    assert(qok1 == 1, "obj_put: fits exactly within the quota")
+    assert_eq_int(bucket_bytes_used(data, "quotafn"), qsize1, "bucket_bytes_used reflects the first write")
+
+    _, _, qok2, qerr2 := obj_put(data, "quotafn", "second.bin", bytes("one more byte tips it!"), "application/octet-stream")
+    assert(qok2 == 2, "obj_put: a second, different blob that would exceed the quota is refused (ok=2)")
+    assert(contains(qerr2, "quota"), "obj_put: the refusal reason mentions the quota")
+    assert_eq_int(bucket_bytes_used(data, "quotafn"), qsize1, "a refused write must not partially count against usage")
+
+    // Re-uploading the SAME bytes under a new key is a dedup hit, not a new
+    // blob — it must succeed even though the bucket is already "full",
+    // because it costs zero additional bytes.
+    _, _, qok3, _ := obj_put(data, "quotafn", "dup-of-first.bin", qraw, "application/octet-stream")
+    assert(qok3 == 1, "obj_put: a dedup hit succeeds even when the bucket is at quota")
+    assert_eq_int(bucket_bytes_used(data, "quotafn"), qsize1, "a dedup hit must not increase bucket_bytes_used")
+
+    bucket_set_quota(data, "quotafn", 0)
+    _, _, qok4, _ := obj_put(data, "quotafn", "second.bin", bytes("one more byte tips it!"), "application/octet-stream")
+    assert(qok4 == 1, "obj_put: the same write that was refused succeeds once the quota is lifted")
+
+    // ---- store.src: global disk-floor helpers ----
+    assert_eq_int(esetres_min_free_bytes(), 512 * 1024 * 1024, "esetres_min_free_bytes: default is 512MB with ESETRES_MIN_FREE_BYTES unset")
+    dfree, dfok := disk_free_bytes(data)
+    assert(dfok == 1, "disk_free_bytes succeeds for a real, existing path")
+    assert(dfree > 0, "disk_free_bytes returns a plausible positive number")
+    _, dfok2 := disk_free_bytes("/no/such/path/at/all")
+    assert(dfok2 == 0, "disk_free_bytes: a nonexistent path fails cleanly (ok=0), not a crash")
+
+    sq := shq("it's")
+    assert(has_prefix(sq, "'") && has_suffix(sq, "'"), "shq wraps a value in single quotes")
+    assert(contains(sq, "'\\''"), "shq escapes an embedded single quote for the shell")
 
     // ---- sigv4.src ----
     ak, ad, ar, ash, asig, apok := sigv4_parse_auth("AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef")
@@ -224,7 +277,7 @@ func main() {
     assert_eq_str(sb3, "", "split_s3_bucket_key: bare slash -> no bucket")
     assert(shk3 == 0, "split_s3_bucket_key: bare slash -> has_key=0")
 
-    _, _, _ := obj_put(data, "mb1", "listme.txt", bytes("xyz"), "text/plain")
+    _, _, _, _ := obj_put(data, "mb1", "listme.txt", bytes("xyz"), "text/plain")
     xml, xok := s3_list_xml(data, "mb1", "")
     assert(xok == 1, "s3_list_xml succeeds for an existing bucket")
     assert(contains(xml, "<Key>listme.txt</Key>"), "s3_list_xml includes the object's key")
@@ -232,7 +285,7 @@ func main() {
     _, xok2 := s3_list_xml(data, "nosuchbucket4", "")
     assert(xok2 == 0, "s3_list_xml: missing bucket -> ok=0")
 
-    tok3, bok3 := bucket_create(data, "s3fn")
+    tok3, bok3 := bucket_create(data, "s3fn", 0)
     assert(bok3 == 1, "setup: bucket_create for s3_handle tests")
     body1 := bytes("s3handle content")
     auth1 := test_sign("PUT", "/s3fn/hello.txt", "s3fn", tok3, region, amzdate, date8, body1)
@@ -262,8 +315,13 @@ func main() {
     delres := s3_handle(data, delreq)
     assert_eq_str(delres.status, "204 No Content", "s3_handle DELETE: 204 on success")
 
+    sqe := s3_quota_exceeded("over quota")
+    assert_eq_str(sqe.status, "507 Insufficient Storage", "s3_quota_exceeded: 507 status")
+    assert(contains(sqe.body, "QuotaExceeded"), "s3_quota_exceeded: synthetic QuotaExceeded code in body")
+
     // ---- server.src ----
     assert_eq_str(wrap("\"a\":1"), "{\"version\":\"1\",\"ok\":true,\"a\":1}", "wrap builds the versioned envelope")
+    assert_eq_str(wrap_err("boom"), "{\"version\":\"1\",\"ok\":false,\"error\":\"boom\"}", "wrap_err builds the versioned error envelope")
 
     unauth := unauthorized()
     assert_eq_str(unauth.status, "401 Unauthorized", "unauthorized() returns 401")
@@ -288,7 +346,7 @@ func main() {
     hres1 := handle(data, Request{path: "/healthz", method: "GET", headers: make(map[string]string), body_bytes: bytes("")})
     assert(contains(hres1.body, "\"ok\":true"), "handle: /healthz returns ok")
 
-    tok4, _ := bucket_create(data, "handlefn")
+    tok4, _ := bucket_create(data, "handlefn", 0)
     putreq2 := Request{method: "PUT", path: "/b/handlefn/o/x.txt", headers: h1("authorization", "Bearer " + tok4), body_bytes: bytes("phase1 body")}
     putres2 := handle(data, putreq2)
     assert_eq_str(putres2.status, "201 Created", "handle: Phase 1 PUT -> 201")

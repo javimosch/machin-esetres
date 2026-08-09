@@ -208,18 +208,22 @@ deferred, per the issue's own staged plan."* So both numbers below are a
 <total functions>` — not a tool-computed percentage. Stated plainly so it's
 never mistaken for `go test -cover`-style instrumentation.
 
-- **Unit** (`./test.sh` → `machin test` over `src/test.src`, 98 assertions,
+- **Unit** (`./test.sh` → `machin test` over `src/test.src`, 123 assertions,
   zero live process — `Request`/`Response` are plain structs, constructed
-  directly): **32/44 functions = 72.7%**, clears the 70% bar. `serve_app`
-  and `main.src`'s 11 CLI-glue functions (`emit`/`die`/`cmd_*`/`main`) are
+  directly): **40/54 functions = 74.1%**, clears the 70% bar. `serve_app`
+  and `main.src`'s 13 CLI-glue functions (`emit`/`die`/`cmd_*`/`main`) are
   the only ones not directly unit-tested — they read real argv or open a
   real listening socket, so a "unit" test of them would just be smoke.sh
-  with extra steps.
+  with extra steps. (Updated 2026-08-09 with the storage-cap feature —
+  re-tallied by hand, not carried over from the Phase 1/2 count.)
 - **Functional/smoke** (`./smoke.sh` → real CLI, real HTTP, real `aws-cli`):
-  traced by hand across the actual run — every one of the 44 functions
-  executes somewhere in it (the CLI-glue functions unit tests skip are
-  exactly what smoke.sh drives directly). **44/44 = 100%**, clears the 50%
-  bar with margin.
+  traced by hand across the actual run — every one of main.src's 13
+  functions (the CLI-glue unit tests skip) executes somewhere in it. One
+  known, disclosed gap: `server.src`'s `wrap_err` (the Phase 1 HTTP
+  quota-exceeded response) is unit-tested but not smoke-tested — the quota
+  cap is smoke-tested via the CLI and the S3 facade, not via a raw Phase 1
+  HTTP PUT past quota. Doesn't threaten the 50% bar (huge margin either
+  way) but stated plainly rather than silently claiming 100% again.
 - **Verified real, not vacuous**: broke `mask_token` (`m = "BROKEN"`), ran
   `./test.sh`, confirmed the exact expected failure
   (`FAIL: mask_token: ... -- got BROKEN, want re_…S574`), then reverted —

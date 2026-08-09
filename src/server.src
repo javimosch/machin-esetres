@@ -3,6 +3,7 @@
 // Auth: Authorization: Bearer <token> — one token per bucket (resolve_bucket_token).
 
 func wrap(body) (s) { s = "{\"version\":\"1\",\"ok\":true," + body + "}" }
+func wrap_err(msg) (s) { s = "{\"version\":\"1\",\"ok\":false,\"error\":" + json(msg) + "}" }
 
 func unauthorized() (r) {
     r = response("401 Unauthorized", "application/json", "{\"version\":\"1\",\"ok\":false,\"error\":\"missing or invalid bearer token\"}")
@@ -71,8 +72,9 @@ func handle(data, req) (res) {
     if req.method == "PUT" {
         ct := header(req, "content-type")
         if ct == "" { ct = "application/octet-stream" }
-        sha, size, ok := obj_put(data, bucket, key, req.body_bytes, ct)
+        sha, size, ok, err_msg := obj_put(data, bucket, key, req.body_bytes, ct)
         if ok == 0 { res = not_found()  return }
+        if ok == 2 { res = response("507 Insufficient Storage", "application/json", wrap_err(err_msg))  return }
         res = created(wrap("\"bucket\":\"" + bucket + "\",\"key\":" + json(key) + ",\"sha256\":\"" + sha + "\",\"size\":" + str(size)))
         return
     }

@@ -52,6 +52,31 @@ test "$code" = "90"
 grep -q '"ok":false' /tmp/machin-esetres-smoke-err
 rm -f /tmp/machin-esetres-smoke-err
 
+# ---- CLI: per-bucket quota is enforced, and exit code is 95 (not a crash) ----
+$BIN bucket create quotabucket --max-bytes "$(stat -c%s "$FILE")" >/dev/null
+$BIN put quotabucket first.pdf "$FILE" --content-type application/pdf >/dev/null
+BIGFILE=$(mktemp /tmp/machin-esetres-smoke-big-XXXX)
+echo "a different, larger file that should not fit" > "$BIGFILE"
+set +e
+$BIN put quotabucket second.pdf "$BIGFILE" --content-type application/pdf >/dev/null 2>/tmp/machin-esetres-smoke-qerr
+qcode=$?
+set -e
+test "$qcode" = "95"
+grep -q "quota" /tmp/machin-esetres-smoke-qerr
+rm -f /tmp/machin-esetres-smoke-qerr "$BIGFILE"
+out=$($BIN bucket list); grep -q "\"name\":\"quotabucket\"" <<<"$out"
+grep -q "\"used_bytes\":$(stat -c%s "$FILE")" <<<"$out"
+
+# ---- CLI: bucket set-quota lifts the cap ----
+out=$($BIN bucket set-quota quotabucket 0); grep -q '"max_bytes":0' <<<"$out"
+$BIN put quotabucket second.pdf "$FILE" --content-type application/pdf >/dev/null
+set +e
+$BIN bucket set-quota nosuchbucket7 100 >/dev/null 2>/tmp/machin-esetres-smoke-qerr2
+q2code=$?
+set -e
+test "$q2code" = "90"
+rm -f /tmp/machin-esetres-smoke-qerr2
+
 # ---- HTTP: auth, PUT/GET/HEAD/DELETE/list, 401/404 ----
 out=$($BIN bucket create httptest); TOKEN2=$(echo "$out" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 $BIN serve --port $PORT >/tmp/machin-esetres-smoke-server.log 2>&1 &
@@ -121,6 +146,19 @@ if command -v aws >/dev/null 2>&1; then
     set -e
     grep -q NoSuchBucket /tmp/machin-esetres-smoke-awserr3
     rm -f /tmp/machin-esetres-smoke-awserr3
+
+    # ---- S3 facade: quota enforcement returns a real S3-shaped error, not a hang ----
+    out=$($BIN bucket create s3quota --max-bytes "$(stat -c%s "$FILE")"); TOKENQ=$(echo "$out" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    AWS_ACCESS_KEY_ID=s3quota AWS_SECRET_ACCESS_KEY="$TOKENQ" \
+      aws --endpoint-url "$ENDPOINT" s3 cp "$FILE" s3://s3quota/first.pdf >/dev/null
+    BIGFILE2=$(mktemp /tmp/machin-esetres-smoke-big2-XXXX)
+    echo "a different, larger file that should not fit under the s3 facade" > "$BIGFILE2"
+    set +e
+    AWS_ACCESS_KEY_ID=s3quota AWS_SECRET_ACCESS_KEY="$TOKENQ" \
+      aws --endpoint-url "$ENDPOINT" s3 cp "$BIGFILE2" s3://s3quota/second.pdf >/dev/null 2>/tmp/machin-esetres-smoke-awserr4
+    set -e
+    grep -q "QuotaExceeded\|Insufficient" /tmp/machin-esetres-smoke-awserr4
+    rm -f /tmp/machin-esetres-smoke-awserr4 "$BIGFILE2"
 
     unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
     echo "OK machin-esetres smoke (Phase 1 + Phase 2 / real aws-cli)"
