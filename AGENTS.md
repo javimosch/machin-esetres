@@ -240,3 +240,38 @@ never mistaken for `go test -cover`-style instrumentation.
   between the signer and the verifier wouldn't silently cancel out. The
   stronger ground-truth check remains smoke.sh's run against a genuine
   `aws-cli`, which neither file's code can influence.
+
+## Incident 2026-08-09: silent schema drift (fixed in v0.2.1)
+
+`sqlite_exec` in machin has **no error return channel at all**. Combined
+with `CREATE TABLE IF NOT EXISTS` being a no-op against a table that
+already exists under an OLDER (fewer-column) shape, this let a real
+production bug through: rbm21's `buckets.db` predated the v0.2.0
+`max_bytes` column (a leftover from earlier v0.1.0-era test buckets whose
+ROWS had been deleted weeks prior — deleting rows never touches the
+table's schema). `bucket create poche-resend-webmail --max-bytes …`
+against that file had its `INSERT` silently fail (no such column), while
+the CLI still printed `{"ok":true}`. The bucket's own directory/`index.db`
+were created correctly; only the registry row in `buckets.db` never
+existed, making the bucket invisible to `bucket list` and to HTTP/S3 auth.
+Not user-reported — caught by chance during a routine post-deploy
+connectivity check.
+
+**Lesson**: when `sqlite_exec` can't report errors, any schema change to a
+table that might already exist on disk under an older shape needs an
+explicit, defensive migration guard — never assume `CREATE TABLE IF NOT
+EXISTS` alone is sufficient once a table has shipped once. "No real
+buckets exist yet" is not the same claim as "the buckets.db file doesn't
+exist with an old schema" — a deleted row leaves the table shape behind.
+
+**Fix (v0.2.1)**: `has_column()` (via `sqlite_query` + `PRAGMA
+table_info`, which — unlike `sqlite_exec` — DOES return data) plus
+`ensure_buckets_schema()`/`ensure_blobs_schema()`, called before every open
+of `buckets.db` or a bucket's `index.db`, `ALTER TABLE ADD COLUMN`-ing
+anything missing. Any future schema addition to these tables should follow
+the same pattern rather than a bare `CREATE TABLE IF NOT EXISTS`. Covered
+by a regression test in `test.src` that reproduces the exact incident
+(manually rolls back a bucket's schema to the pre-v0.2.0 shape), confirmed
+to fail without the fix and pass with it. Full incident record, including
+the manual production repair applied before the code fix shipped:
+`~/backups/machin-esetres/access.txt`.
