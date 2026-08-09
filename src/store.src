@@ -76,12 +76,51 @@ func disk_free_bytes(path) (n, ok) {
     ok = 1
 }
 
+type ColInfo struct { name string }
+
+// has_column checks whether table already has column. machin's sqlite_exec
+// has NO error return at all — a CREATE TABLE IF NOT EXISTS is a silent
+// no-op against a table that already exists under an OLDER shape, so an
+// INSERT/UPDATE naming a newer column fails with no signal whatsoever.
+// (This is exactly how a real production incident happened: a buckets.db
+// left over from before the max_bytes column existed made bucket_create's
+// INSERT vanish silently — the bucket's own directory got created, but the
+// registry row never did, so the bucket was invisible to bucket list/HTTP
+// auth despite bucket_create reporting ok=1.)
+func has_column(db, table, column) (ok) {
+    ok = 0
+    rows := sqlite_query(db, "PRAGMA table_info(" + table + ")")
+    for _, c := range parse(rows, []ColInfo{}) {
+        if c.name == column { ok = 1  return }
+    }
+}
+
+// ensure_buckets_schema creates the buckets table if missing, and ALTERs in
+// any column a later version introduced, on every open — cheap (one PRAGMA
+// query) and the only reliable guard given sqlite_exec's silence.
+func ensure_buckets_schema(reg) {
+    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER)")
+    if has_column(reg, "buckets", "max_bytes") == 0 {
+        sqlite_exec(reg, "ALTER TABLE buckets ADD COLUMN max_bytes INTEGER DEFAULT 0")
+    }
+}
+
+// ensure_blobs_schema is the same guard for a bucket's own index.db.
+func ensure_blobs_schema(idxdb) {
+    sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS objects(key TEXT PRIMARY KEY, sha TEXT, size INTEGER, content_type TEXT, created_at INTEGER)")
+    sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS blobs(sha TEXT PRIMARY KEY, refcount INTEGER)")
+    if has_column(idxdb, "blobs", "size") == 0 {
+        sqlite_exec(idxdb, "ALTER TABLE blobs ADD COLUMN size INTEGER DEFAULT 0")
+    }
+}
+
 // resolve_bucket_token looks up a bucket's bearer token — the HTTP layer's auth check.
 func resolve_bucket_token(data, name) (token, ok) {
     token = ""
     ok = 0
     if !is_dir(data) { return }
     reg := sqlite_open(data + "/buckets.db")
+    ensure_buckets_schema(reg)
     rows := sqlite_query(reg, "SELECT token FROM buckets WHERE name=?", []string{name})
     sqlite_close(reg)
     list := parse(rows, []TokenRow{})
@@ -102,12 +141,11 @@ func bucket_create(data, name, max_bytes) (token, ok) {
     if is_dir(bdir) { return }
     mkdir_p(bdir + "/objects")
     idxdb := sqlite_open(bdir + "/index.db")
-    sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS objects(key TEXT PRIMARY KEY, sha TEXT, size INTEGER, content_type TEXT, created_at INTEGER)")
-    sqlite_exec(idxdb, "CREATE TABLE IF NOT EXISTS blobs(sha TEXT PRIMARY KEY, refcount INTEGER, size INTEGER)")
+    ensure_blobs_schema(idxdb)
     sqlite_close(idxdb)
     token = to_hex(rand_bytes(16))
     reg := sqlite_open(data + "/buckets.db")
-    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER, max_bytes INTEGER)")
+    ensure_buckets_schema(reg)
     sqlite_exec(reg, "INSERT INTO buckets(name, token, created_at, max_bytes) VALUES(?, ?, ?, ?)", []string{name, token, str(now()), str(max_bytes)})
     sqlite_close(reg)
     ok = 1
@@ -118,6 +156,7 @@ func bucket_set_quota(data, name, max_bytes) (ok) {
     ok = 0
     if !is_dir(bucket_dir(data, name)) { return }
     reg := sqlite_open(data + "/buckets.db")
+    ensure_buckets_schema(reg)
     sqlite_exec(reg, "UPDATE buckets SET max_bytes=? WHERE name=?", []string{str(max_bytes), name})
     sqlite_close(reg)
     ok = 1
@@ -127,6 +166,7 @@ func bucket_quota(data, name) (max_bytes, ok) {
     max_bytes = 0
     ok = 0
     reg := sqlite_open(data + "/buckets.db")
+    ensure_buckets_schema(reg)
     rows := sqlite_query(reg, "SELECT max_bytes FROM buckets WHERE name=?", []string{name})
     sqlite_close(reg)
     list := parse(rows, []QuotaRow{})
@@ -141,6 +181,7 @@ func bucket_bytes_used(data, name) (used) {
     bdir := bucket_dir(data, name)
     if !is_dir(bdir) { return }
     idxdb := sqlite_open(bdir + "/index.db")
+    ensure_blobs_schema(idxdb)
     rows := sqlite_query(idxdb, "SELECT COALESCE(SUM(size),0) AS total FROM blobs")
     sqlite_close(idxdb)
     list := parse(rows, []SumRow{})
@@ -151,7 +192,7 @@ func bucket_list_body(data) (body) {
     body = "\"buckets\":[]"
     if !is_dir(data) { return }
     reg := sqlite_open(data + "/buckets.db")
-    sqlite_exec(reg, "CREATE TABLE IF NOT EXISTS buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER, max_bytes INTEGER)")
+    ensure_buckets_schema(reg)
     rows := sqlite_query(reg, "SELECT name, token, created_at, max_bytes FROM buckets ORDER BY name")
     sqlite_close(reg)
     list := parse(rows, []BucketRow{})
@@ -201,6 +242,7 @@ func obj_put(data, bucket, key, raw, content_type) (sha, size, ok, err_msg) {
     bdir := bucket_dir(data, bucket)
     if !is_dir(bdir) { err_msg = "no such bucket: " + bucket  return }
     idxdb := sqlite_open(bdir + "/index.db")
+    ensure_blobs_schema(idxdb)
     sha = to_hex(sha256_bytes(raw))
     size = len(raw)
 
@@ -262,6 +304,7 @@ func obj_stat(data, bucket, key) (size, ct, ok) {
     bdir := bucket_dir(data, bucket)
     if !is_dir(bdir) { return }
     idxdb := sqlite_open(bdir + "/index.db")
+    ensure_blobs_schema(idxdb)
     rows := sqlite_query(idxdb, "SELECT size, content_type FROM objects WHERE key=?", []string{key})
     sqlite_close(idxdb)
     list := parse(rows, []ObjStat{})
@@ -283,6 +326,7 @@ func obj_get(data, bucket, key) (raw, ct, sha, created_at, ok) {
     bdir := bucket_dir(data, bucket)
     if !is_dir(bdir) { return }
     idxdb := sqlite_open(bdir + "/index.db")
+    ensure_blobs_schema(idxdb)
     rows := sqlite_query(idxdb, "SELECT sha, content_type, created_at FROM objects WHERE key=?", []string{key})
     sqlite_close(idxdb)
     list := parse(rows, []ObjMeta{})
@@ -299,6 +343,7 @@ func obj_delete(data, bucket, key) (ok) {
     bdir := bucket_dir(data, bucket)
     if !is_dir(bdir) { return }
     idxdb := sqlite_open(bdir + "/index.db")
+    ensure_blobs_schema(idxdb)
     rows := sqlite_query(idxdb, "SELECT sha FROM objects WHERE key=?", []string{key})
     list := parse(rows, []ShaRow{})
     if len(list) == 0 { sqlite_close(idxdb)  return }
@@ -316,6 +361,7 @@ func obj_list_body(data, bucket, prefix) (body, ok) {
     bdir := bucket_dir(data, bucket)
     if !is_dir(bdir) { return }
     idxdb := sqlite_open(bdir + "/index.db")
+    ensure_blobs_schema(idxdb)
     rows := ""
     if prefix == "" {
         rows = sqlite_query(idxdb, "SELECT key, sha, size, content_type, created_at FROM objects ORDER BY key")

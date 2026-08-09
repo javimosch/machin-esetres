@@ -96,6 +96,34 @@ func main() {
     su2 := bucket_set_quota(data, "nosuchbucket3", 1)
     assert(su2 == 0, "bucket_set_quota: unknown bucket -> ok=0")
 
+    // ---- regression: a buckets.db/index.db left over from BEFORE max_bytes/
+    // size existed must self-heal, not silently drop writes. This reproduces
+    // a real production incident: CREATE TABLE IF NOT EXISTS is a no-op
+    // against an existing OLDER-shaped table, and machin's sqlite_exec has
+    // NO error return at all — an INSERT/UPDATE naming a column that table
+    // doesn't have simply vanishes, while the caller sees no failure signal.
+    old_data := mktmp()
+    mkdir_p(old_data)
+    old_reg := sqlite_open(old_data + "/buckets.db")
+    sqlite_exec(old_reg, "CREATE TABLE buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER)")   // pre-v0.2.0 shape, no max_bytes
+    sqlite_close(old_reg)
+    _, oldok := bucket_create(old_data, "legacyfn", 500)
+    assert(oldok == 1, "bucket_create against a pre-existing OLD-shaped buckets.db still reports success")
+    oldq, oldqok := bucket_quota(old_data, "legacyfn")
+    assert(oldqok == 1, "bucket_quota finds the bucket created against the old schema")
+    assert_eq_int(oldq, 500, "the quota actually PERSISTED — this is the exact write that silently vanished in production before the fix")
+    oldlist := bucket_list_body(old_data)
+    assert(contains(oldlist, "legacyfn"), "bucket_list_body sees the bucket created against the old schema")
+
+    old_bdir := bucket_dir(old_data, "legacyfn")
+    old_idx := sqlite_open(old_bdir + "/index.db")
+    sqlite_exec(old_idx, "DROP TABLE IF EXISTS blobs")
+    sqlite_exec(old_idx, "CREATE TABLE blobs(sha TEXT PRIMARY KEY, refcount INTEGER)")   // pre-v0.2.0 shape, no size
+    sqlite_close(old_idx)
+    _, oldsize, oldpok, _ := obj_put(old_data, "legacyfn", "k", bytes("legacy bytes"), "text/plain")
+    assert(oldpok == 1, "obj_put succeeds against a pre-existing OLD-shaped blobs table")
+    assert_eq_int(bucket_bytes_used(old_data, "legacyfn"), oldsize, "bucket_bytes_used reflects the write — this silently read 0 before the fix")
+
     _, oknone := resolve_bucket_token(data, "nosuchbucket")
     assert(oknone == 0, "resolve_bucket_token: unknown bucket -> ok=0")
 
