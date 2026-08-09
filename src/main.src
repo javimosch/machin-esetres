@@ -3,7 +3,7 @@
 // integration · 110-119 internal). `help-json` is the self-describing
 // catalog an agent reads first. Same contract as machin-vault.
 
-var esetres_version = "0.2.0"
+var esetres_version = "0.2.1"
 
 func emit(body) { println("{\"version\":\"1\",\"ok\":true," + body + "}") }
 func die(code, msg) { write(2, "{\"version\":\"1\",\"ok\":false,\"error\":" + json(msg) + "}\n")  exit(code) }
