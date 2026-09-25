@@ -275,3 +275,19 @@ by a regression test in `test.src` that reproduces the exact incident
 to fail without the fix and pass with it. Full incident record, including
 the manual production repair applied before the code fix shipped:
 `~/backups/machin-esetres/access.txt`.
+
+## Public buckets + assets.intrane.fr deployment (2026-09-25)
+
+Added a per-bucket `public` flag (`bucket create --public`, `bucket set-public <name> <0|1>`;
+new `buckets.public` column via the same self-healing ALTER pattern as `max_bytes`). Public
+buckets allow **anonymous GET/HEAD** (objects + listings) on both the Phase 1 REST path and
+the S3 facade; every write still requires the bucket token / valid SigV4. v0.3.0.
+
+A second instance now runs on **dk1** (`machin-esetres.service`, port **8710**, data
+`/opt/esetres/data`, binary `/opt/esetres/machin-esetres`) behind Traefik at
+**assets.intrane.fr** (`/etc/traefik/dynamic.d/30-assets-intrane.yml`, DNS grey-cloud A/AAAA
+→ dk1). Purpose: shared public asset host for hart landings (bplus-robotics.com) and other
+apps needing external scripts/css/fonts — hart's CSP can't serve them. This is deliberately
+a *separate* instance from the internal rbm21 one, not a change to its internal-only design.
+Bucket convention: one public bucket per project (`bplus-robotics`, 500MB quota); bucket
+tokens distributed via the project's hart runbook.
