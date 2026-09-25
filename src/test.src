@@ -74,7 +74,7 @@ func main() {
 
     // ---- store.src: bucket lifecycle ----
     data := mktmp()
-    tok, ok := bucket_create(data, "mb1", 0)
+    tok, ok := bucket_create(data, "mb1", 0, 0)
     assert(ok == 1, "bucket_create succeeds for a new bucket")
     assert(len(tok) > 0, "bucket_create returns a nonempty token")
 
@@ -82,7 +82,7 @@ func main() {
     assert(ok2 == 1, "resolve_bucket_token finds the bucket")
     assert_eq_str(tok2, tok, "resolve_bucket_token returns the token bucket_create minted")
 
-    _, okdup := bucket_create(data, "mb1", 0)
+    _, okdup := bucket_create(data, "mb1", 0, 0)
     assert(okdup == 0, "bucket_create refuses to recreate an existing bucket")
 
     q, qok := bucket_quota(data, "mb1")
@@ -107,7 +107,7 @@ func main() {
     old_reg := sqlite_open(old_data + "/buckets.db")
     sqlite_exec(old_reg, "CREATE TABLE buckets(name TEXT PRIMARY KEY, token TEXT, created_at INTEGER)")   // pre-v0.2.0 shape, no max_bytes
     sqlite_close(old_reg)
-    _, oldok := bucket_create(old_data, "legacyfn", 500)
+    _, oldok := bucket_create(old_data, "legacyfn", 500, 0)
     assert(oldok == 1, "bucket_create against a pre-existing OLD-shaped buckets.db still reports success")
     oldq, oldqok := bucket_quota(old_data, "legacyfn")
     assert(oldqok == 1, "bucket_quota finds the bucket created against the old schema")
@@ -195,7 +195,7 @@ func main() {
 
     // ---- store.src: per-bucket quota enforcement ----
     quota_bucket_size := 19   // "quota test bytes!!!" is exactly 19 bytes
-    _, qbok := bucket_create(data, "quotafn", quota_bucket_size)
+    _, qbok := bucket_create(data, "quotafn", quota_bucket_size, 0)
     assert(qbok == 1, "setup: bucket_create with a small quota")
     qraw := bytes("quota test bytes!!!")
     assert_eq_int(len(qraw), quota_bucket_size, "setup: fixture is exactly the quota size")
@@ -313,7 +313,7 @@ func main() {
     _, xok2 := s3_list_xml(data, "nosuchbucket4", "")
     assert(xok2 == 0, "s3_list_xml: missing bucket -> ok=0")
 
-    tok3, bok3 := bucket_create(data, "s3fn", 0)
+    tok3, bok3 := bucket_create(data, "s3fn", 0, 0)
     assert(bok3 == 1, "setup: bucket_create for s3_handle tests")
     body1 := bytes("s3handle content")
     auth1 := test_sign("PUT", "/s3fn/hello.txt", "s3fn", tok3, region, amzdate, date8, body1)
@@ -374,7 +374,7 @@ func main() {
     hres1 := handle(data, Request{path: "/healthz", method: "GET", headers: make(map[string]string), body_bytes: bytes("")})
     assert(contains(hres1.body, "\"ok\":true"), "handle: /healthz returns ok")
 
-    tok4, _ := bucket_create(data, "handlefn", 0)
+    tok4, _ := bucket_create(data, "handlefn", 0, 0)
     putreq2 := Request{method: "PUT", path: "/b/handlefn/o/x.txt", headers: h1("authorization", "Bearer " + tok4), body_bytes: bytes("phase1 body")}
     putres2 := handle(data, putreq2)
     assert_eq_str(putres2.status, "201 Created", "handle: Phase 1 PUT -> 201")
@@ -389,6 +389,27 @@ func main() {
 
     s3viahandle := handle(data, Request{method: "GET", path: "/nosuchbucket6", headers: make(map[string]string), body_bytes: bytes("")})
     assert_eq_str(s3viahandle.status, "404 Not Found", "handle: a path not under /b/ falls through to the S3 facade")
+
+    // ---- public buckets: anonymous GET/HEAD pass, writes still authed ----
+    tokp, pbok := bucket_create(data, "pubfn", 0, 1)
+    assert(pbok == 1, "setup: bucket_create --public")
+    assert_eq_int(bucket_is_public(data, "pubfn"), 1, "bucket_is_public reads the flag")
+    assert_eq_int(bucket_is_public(data, "handlefn"), 0, "bucket_is_public is 0 for a normal bucket")
+    handle(data, Request{method: "PUT", path: "/b/pubfn/o/a.css", headers: h1("authorization", "Bearer " + tokp), body_bytes: bytes("body{}")})
+    pubget := handle(data, Request{method: "GET", path: "/b/pubfn/o/a.css", headers: make(map[string]string), body_bytes: bytes("")})
+    assert_eq_str(bytes_str(pubget.bin), "body{}", "public bucket: anonymous GET returns bytes")
+    publist := handle(data, Request{method: "GET", path: "/b/pubfn", headers: make(map[string]string), body_bytes: bytes("")})
+    assert(contains(publist.body, "a.css"), "public bucket: anonymous list works")
+    pubput := handle(data, Request{method: "PUT", path: "/b/pubfn/o/evil.js", headers: make(map[string]string), body_bytes: bytes("x")})
+    assert_eq_str(pubput.status, "401 Unauthorized", "public bucket: anonymous PUT still 401")
+    pubdel := handle(data, Request{method: "DELETE", path: "/b/pubfn/o/a.css", headers: make(map[string]string), body_bytes: bytes("")})
+    assert_eq_str(pubdel.status, "401 Unauthorized", "public bucket: anonymous DELETE still 401")
+    s3pub := s3_handle(data, Request{method: "GET", path: "/pubfn/a.css", headers: make(map[string]string), body_bytes: bytes("")})
+    assert_eq_str(bytes_str(s3pub.bin), "body{}", "public bucket: S3 path serves anonymous GET too")
+    setok := bucket_set_public(data, "pubfn", 0)
+    assert(setok == 1, "bucket_set_public flips the flag")
+    privget := handle(data, Request{method: "GET", path: "/b/pubfn/o/a.css", headers: make(map[string]string), body_bytes: bytes("")})
+    assert_eq_str(privget.status, "401 Unauthorized", "after set-public 0, anonymous GET is 401 again")
 
     test_summary()
 }

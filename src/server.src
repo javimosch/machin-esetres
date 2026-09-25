@@ -56,7 +56,12 @@ func handle(data, req) (res) {
     if bucket == "" { res = not_found()  return }
     token, tok_ok := resolve_bucket_token(data, bucket)
     if tok_ok == 0 { res = not_found()  return }
-    if check_bearer(req, token) == 0 { res = unauthorized()  return }
+    // Public buckets: anonymous GET/HEAD pass; every write still needs the token.
+    if check_bearer(req, token) == 0 {
+        anon := 0
+        if bucket_is_public(data, bucket) == 1 && (req.method == "GET" || req.method == "HEAD") { anon = 1 }
+        if anon == 0 { res = unauthorized()  return }
+    }
 
     if has_key == 0 {
         if req.method == "GET" {

@@ -105,8 +105,15 @@ func s3_handle(data, req) (res) {
     if tok_ok == 0 { res = s3_no_such_bucket(bucket)  return }
 
     access_key, sig_ok := sigv4_verify(req, path_no_query(req.path), secret)
-    if sig_ok == 0 { res = s3_forbidden("signature verification failed")  return }
-    if access_key != bucket { res = s3_forbidden("credential does not match bucket")  return }
+    authed := 0
+    if sig_ok == 1 && access_key == bucket { authed = 1 }
+    if authed == 0 {
+        // Public buckets: anonymous GET/HEAD pass; everything else still
+        // requires a valid SigV4 signature over the bucket's token.
+        anon := 0
+        if bucket_is_public(data, bucket) == 1 && (req.method == "GET" || req.method == "HEAD") { anon = 1 }
+        if anon == 0 { res = s3_forbidden("signature verification failed")  return }
+    }
 
     if has_key == 0 {
         if req.method == "GET" {

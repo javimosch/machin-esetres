@@ -15,9 +15,10 @@
 type ShaRow struct { sha string }
 type ObjMeta struct { sha string  content_type string  created_at int }
 type BlobRow struct { sha string  refcount int }
-type BucketRow struct { name string  token string  created_at int  max_bytes int }
+type BucketRow struct { name string  token string  created_at int  max_bytes int  public int }
 type TokenRow struct { token string }
 type QuotaRow struct { max_bytes int }
+type PubRow struct { public int }
 type SumRow struct { total int }
 
 func bucket_dir(data, name) (p) { p = data + "/" + name }
@@ -103,6 +104,9 @@ func ensure_buckets_schema(reg) {
     if has_column(reg, "buckets", "max_bytes") == 0 {
         sqlite_exec(reg, "ALTER TABLE buckets ADD COLUMN max_bytes INTEGER DEFAULT 0")
     }
+    if has_column(reg, "buckets", "public") == 0 {
+        sqlite_exec(reg, "ALTER TABLE buckets ADD COLUMN public INTEGER DEFAULT 0")
+    }
 }
 
 // ensure_blobs_schema is the same guard for a bucket's own index.db.
@@ -127,6 +131,31 @@ func resolve_bucket_token(data, name) (token, ok) {
     if len(list) > 0 { token = list[0].token  ok = 1 }
 }
 
+// bucket_is_public returns 1 when the bucket allows anonymous reads
+// (GET/HEAD on objects and bucket list). Writes always require the token
+// regardless — public is a read flag only.
+func bucket_is_public(data, name) (pub) {
+    pub = 0
+    if !is_dir(data) { return }
+    reg := sqlite_open(data + "/buckets.db")
+    ensure_buckets_schema(reg)
+    rows := sqlite_query(reg, "SELECT public FROM buckets WHERE name=?", []string{name})
+    sqlite_close(reg)
+    list := parse(rows, []PubRow{})
+    if len(list) > 0 { pub = list[0].public }
+}
+
+// bucket_set_public flips an existing bucket's anonymous-read flag.
+func bucket_set_public(data, name, pub) (ok) {
+    ok = 0
+    if !is_dir(bucket_dir(data, name)) { return }
+    reg := sqlite_open(data + "/buckets.db")
+    ensure_buckets_schema(reg)
+    sqlite_exec(reg, "UPDATE buckets SET public=? WHERE name=?", []string{str(pub), name})
+    sqlite_close(reg)
+    ok = 1
+}
+
 // bucket_create makes a bucket dir + its index tables, mints a token, and
 // registers it. CLI-only in Phase 1 (no HTTP route creates buckets), so it is
 // allowed to be the one "core" function that's fine to wrap with die() at the
@@ -134,7 +163,7 @@ func resolve_bucket_token(data, name) (token, ok) {
 // bucket_create makes a bucket dir + its index tables, mints a token, and
 // registers it. max_bytes is a per-bucket cap on total blob bytes (0 =
 // unlimited — see the "cannot grow indefinitely" rationale on obj_put).
-func bucket_create(data, name, max_bytes) (token, ok) {
+func bucket_create(data, name, max_bytes, public) (token, ok) {
     ok = 0
     token = ""
     bdir := bucket_dir(data, name)
@@ -146,7 +175,7 @@ func bucket_create(data, name, max_bytes) (token, ok) {
     token = to_hex(rand_bytes(16))
     reg := sqlite_open(data + "/buckets.db")
     ensure_buckets_schema(reg)
-    sqlite_exec(reg, "INSERT INTO buckets(name, token, created_at, max_bytes) VALUES(?, ?, ?, ?)", []string{name, token, str(now()), str(max_bytes)})
+    sqlite_exec(reg, "INSERT INTO buckets(name, token, created_at, max_bytes, public) VALUES(?, ?, ?, ?, ?)", []string{name, token, str(now()), str(max_bytes), str(public)})
     sqlite_close(reg)
     ok = 1
 }
@@ -193,7 +222,7 @@ func bucket_list_body(data) (body) {
     if !is_dir(data) { return }
     reg := sqlite_open(data + "/buckets.db")
     ensure_buckets_schema(reg)
-    rows := sqlite_query(reg, "SELECT name, token, created_at, max_bytes FROM buckets ORDER BY name")
+    rows := sqlite_query(reg, "SELECT name, token, created_at, max_bytes, public FROM buckets ORDER BY name")
     sqlite_close(reg)
     list := parse(rows, []BucketRow{})
     s := "\"buckets\":["
@@ -202,7 +231,7 @@ func bucket_list_body(data) (body) {
         if i > 0 { s = s + "," }
         used := bucket_bytes_used(data, b.name)
         s = s + "{\"name\":\"" + b.name + "\",\"token\":\"" + mask_token(b.token) + "\",\"created_at\":" + str(b.created_at) +
-            ",\"used_bytes\":" + str(used) + ",\"max_bytes\":" + str(b.max_bytes) + "}"
+            ",\"used_bytes\":" + str(used) + ",\"max_bytes\":" + str(b.max_bytes) + ",\"public\":" + str(b.public) + "}"
         i = i + 1
     }
     s = s + "]"
