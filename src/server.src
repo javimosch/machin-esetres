@@ -70,6 +70,14 @@ func handle(data, req) (res) {
             res = ok_json(wrap(body))
             return
         }
+        if req.method == "DELETE" {
+            // Clear the bucket — destructive, always token-gated (anonymous
+            // callers never reach here: public only unlocks GET/HEAD).
+            deleted, ok := bucket_clear(data, bucket)
+            if ok == 0 { res = not_found()  return }
+            res = ok_json(wrap("\"bucket\":\"" + bucket + "\",\"cleared\":" + str(deleted)))
+            return
+        }
         res = not_found()
         return
     }

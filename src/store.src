@@ -19,6 +19,7 @@ type BucketRow struct { name string  token string  created_at int  max_bytes int
 type TokenRow struct { token string }
 type QuotaRow struct { max_bytes int }
 type PubRow struct { public int }
+type KeyRow struct { key string }
 type SumRow struct { total int }
 
 func bucket_dir(data, name) (p) { p = data + "/" + name }
@@ -379,6 +380,25 @@ func obj_delete(data, bucket, key) (ok) {
     sqlite_exec(idxdb, "DELETE FROM objects WHERE key=?", []string{key})
     blob_ref_dec(bdir, idxdb, list[0].sha)
     sqlite_close(idxdb)
+    ok = 1
+}
+
+// bucket_clear deletes every object in the bucket. Iterates keys through
+// obj_delete so blob refcounts/deletes stay correct — a wholesale
+// directory wipe would orphan blobs the refcounting can't see. For a
+// bucket-sized wipe this is fine (buckets are quota-capped anyway).
+func bucket_clear(data, name) (deleted, ok) {
+    deleted = 0
+    ok = 0
+    bdir := bucket_dir(data, name)
+    if !is_dir(bdir) { return }
+    idxdb := sqlite_open(bdir + "/index.db")
+    ensure_blobs_schema(idxdb)
+    rows := sqlite_query(idxdb, "SELECT key FROM objects")
+    sqlite_close(idxdb)
+    for _, k := range parse(rows, []KeyRow{}) {
+        if obj_delete(data, name, k.key) == 1 { deleted = deleted + 1 }
+    }
     ok = 1
 }
 

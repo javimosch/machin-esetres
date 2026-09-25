@@ -411,5 +411,22 @@ func main() {
     privget := handle(data, Request{method: "GET", path: "/b/pubfn/o/a.css", headers: make(map[string]string), body_bytes: bytes("")})
     assert_eq_str(privget.status, "401 Unauthorized", "after set-public 0, anonymous GET is 401 again")
 
+    // ---- bucket_clear: wipes every object, refcount-aware ----
+    handle(data, Request{method: "PUT", path: "/b/pubfn/o/b.css", headers: h1("authorization", "Bearer " + tokp), body_bytes: bytes("b{}")})
+    handle(data, Request{method: "PUT", path: "/b/pubfn/o/c.css", headers: h1("authorization", "Bearer " + tokp), body_bytes: bytes("c{}")})
+    ndel, cok := bucket_clear(data, "pubfn")
+    assert(cok == 1, "bucket_clear ok on existing bucket")
+    assert_eq_int(ndel, 3, "bucket_clear deleted all 3 objects")
+    lbody, _ := obj_list_body(data, "pubfn", "")
+    assert(contains(lbody, "\"items\":[]"), "bucket_clear leaves an empty index")
+    _, _, cdok := obj_stat(data, "pubfn", "a.css")
+    assert(cdok == 0, "bucket_clear: objects are really gone")
+    httpclr := handle(data, Request{method: "DELETE", path: "/b/pubfn", headers: h1("authorization", "Bearer " + tokp), body_bytes: bytes("")})
+    assert_eq_str(httpclr.status, "200 OK", "DELETE /b/<bucket> clears via HTTP (token-gated)")
+    anonclr := handle(data, Request{method: "DELETE", path: "/b/pubfn", headers: make(map[string]string), body_bytes: bytes("")})
+    assert_eq_str(anonclr.status, "401 Unauthorized", "anonymous DELETE /b/<bucket> is refused even on a public bucket")
+    _, ncok := bucket_clear(data, "nosuchbucket7")
+    assert(ncok == 0, "bucket_clear: missing bucket -> ok=0")
+
     test_summary()
 }
