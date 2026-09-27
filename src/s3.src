@@ -147,6 +147,9 @@ func s3_handle(data, req) (res) {
         if ok == 0 { res = s3_no_such_key(key)  return }
         lm := time_format_utc(created_at, "%a, %d %b %Y %H:%M:%S GMT")
         res = with_header(with_header(ok_bytes(ct, raw), "ETag", "\"" + sha + "\""), "Last-Modified", lm)
+        // CORS for public buckets: browsers fetch module scripts/fonts via
+        // cross-origin GET, and a public-read object has nothing to hide.
+        if bucket_is_public(data, bucket) == 1 { res = with_header(res, "Access-Control-Allow-Origin", "*") }
         return
     }
     if req.method == "DELETE" {

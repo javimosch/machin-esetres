@@ -95,6 +95,10 @@ func handle(data, req) (res) {
         raw, ct, _, _, ok := obj_get(data, bucket, key)
         if ok == 0 { res = not_found()  return }
         res = ok_bytes(ct, raw)
+        // CORS for public buckets: browsers fetch module scripts/<link>/fetch()
+        // cross-origin, and a public-read object has nothing to hide. Writes stay
+        // token-gated (and non-simple, so browsers still preflight-block them).
+        if bucket_is_public(data, bucket) == 1 { res = with_header(res, "Access-Control-Allow-Origin", "*") }
         return
     }
     if req.method == "HEAD" {
